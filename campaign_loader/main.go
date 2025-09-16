@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -28,11 +26,7 @@ type CampaignData struct {
 	CampaignID string
 	Address    string
 	Geometry   string
-	Polygon    string
-	BBoxMinLat float64
-	BBoxMaxLat float64
-	BBoxMinLon float64
-	BBoxMaxLon float64
+	Polygon    [][][2]float64 // ClickHouse Polygon type
 }
 
 func main() {
@@ -44,7 +38,6 @@ func main() {
 		CHPassword: "nyros",
 	}
 
-	// Updated root directory path
 	rootDir := "/mnt/blobcontainer/Geocoded"
 
 	if err := processDirectory(rootDir, config); err != nil {
@@ -71,15 +64,13 @@ func processDirectory(rootDir string, config Config) error {
 	err = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Error accessing path %s: %v", path, err)
-			return nil // Continue processing other files
+			return nil
 		}
 
-		// Process only CSV files
 		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".csv") {
 			log.Printf("Processing file: %s", path)
 			if err := processCSVFile(path, db); err != nil {
 				log.Printf("Error processing file %s: %v", path, err)
-				// Continue with other files instead of stopping
 			}
 		}
 		return nil
@@ -101,7 +92,6 @@ func connectClickHouse(config Config) (*sql.DB, error) {
 		return nil, err
 	}
 
-	// Test the connection
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
@@ -116,10 +106,6 @@ func createTable(db *sql.DB) error {
 		address String,
 		geometry String,
 		polygon Polygon,
-		bbox_min_lat Float64,
-		bbox_max_lat Float64,
-		bbox_min_lon Float64,
-		bbox_max_lon Float64,
 		created_at DateTime DEFAULT now()
 	) ENGINE = MergeTree()
 	ORDER BY (campaign_id, created_at)
@@ -136,32 +122,27 @@ func processCSVFile(filePath string, db *sql.DB) error {
 		return fmt.Errorf("could not extract campaign ID from filename: %s", filePath)
 	}
 
-	// Open CSV file
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %v", err)
 	}
 	defer file.Close()
 
-	// Create CSV reader
 	reader := csv.NewReader(file)
 
-	// Read header row
+	// Read header
 	headers, err := reader.Read()
 	if err != nil {
 		return fmt.Errorf("failed to read headers: %v", err)
 	}
 
-	// Find column indices
 	addressIndex, geometryIndex := findColumnIndices(headers)
 	if addressIndex == -1 || geometryIndex == -1 {
 		return fmt.Errorf("required columns not found. Headers: %v", headers)
 	}
 
-	// Prepare batch insert
 	var campaignData []CampaignData
 
-	// Read data rows
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
@@ -172,21 +153,18 @@ func processCSVFile(filePath string, db *sql.DB) error {
 			continue
 		}
 
-		// Skip rows that don't have enough columns
 		if len(record) <= addressIndex || len(record) <= geometryIndex {
 			continue
 		}
 
 		address := strings.TrimSpace(record[addressIndex])
 		geometry := strings.TrimSpace(record[geometryIndex])
-
-		// Skip empty rows
 		if address == "" || geometry == "" {
 			continue
 		}
 
-		// Parse polygon and calculate bounding box
-		polygon, bbox, err := parsePolygonAndBBox(geometry)
+		// Parse WKT polygon into ClickHouse format
+		polygon, err := parseWKTPolygon(geometry)
 		if err != nil {
 			log.Printf("Error parsing geometry for address %s: %v", address, err)
 			continue
@@ -197,14 +175,9 @@ func processCSVFile(filePath string, db *sql.DB) error {
 			Address:    address,
 			Geometry:   geometry,
 			Polygon:    polygon,
-			BBoxMinLat: bbox.MinLat,
-			BBoxMaxLat: bbox.MaxLat,
-			BBoxMinLon: bbox.MinLon,
-			BBoxMaxLon: bbox.MaxLon,
 		})
 	}
 
-	// Insert data into ClickHouse
 	if len(campaignData) > 0 {
 		if err := insertCampaignData(db, campaignData); err != nil {
 			return fmt.Errorf("failed to insert data: %v", err)
@@ -215,88 +188,45 @@ func processCSVFile(filePath string, db *sql.DB) error {
 	return nil
 }
 
-// BoundingBox represents the bounding box of a polygon
-type BoundingBox struct {
-	MinLat, MaxLat, MinLon, MaxLon float64
-}
+func parseWKTPolygon(wkt string) ([][][2]float64, error) {
+	// Expect POLYGON ((x y, x y, ...))
+	wkt = strings.TrimSpace(wkt)
+	wkt = strings.TrimPrefix(wkt, "POLYGON ((")
+	wkt = strings.TrimSuffix(wkt, "))")
 
-// parsePolygonAndBBox parses WKT POLYGON and extracts bounding box
-func parsePolygonAndBBox(wktPolygon string) (string, BoundingBox, error) {
-	// Remove POLYGON and parentheses to get coordinate pairs
-	re := regexp.MustCompile(`POLYGON\s*\(\s*\((.*?)\)\s*\)`)
-	matches := re.FindStringSubmatch(wktPolygon)
-	if len(matches) < 2 {
-		return "", BoundingBox{}, fmt.Errorf("invalid POLYGON format: %s", wktPolygon)
+	coords := strings.Split(wkt, ",")
+	points := make([][2]float64, 0, len(coords))
+
+	for _, c := range coords {
+		parts := strings.Fields(strings.TrimSpace(c))
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid coord: %s", c)
+		}
+
+		x, err1 := strconv.ParseFloat(parts[0], 64)
+		y, err2 := strconv.ParseFloat(parts[1], 64)
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("invalid float in coord: %s", c)
+		}
+
+		points = append(points, [2]float64{x, y})
 	}
 
-	coordsStr := matches[1]
-	coordPairs := strings.Split(coordsStr, ",")
-
-	var minLat, maxLat, minLon, maxLon float64
-	var points []string
-
-	for i, pair := range coordPairs {
-		coords := strings.Fields(strings.TrimSpace(pair))
-		if len(coords) != 2 {
-			continue
-		}
-
-		lon, err := strconv.ParseFloat(coords[0], 64)
-		if err != nil {
-			continue
-		}
-		lat, err := strconv.ParseFloat(coords[1], 64)
-		if err != nil {
-			continue
-		}
-
-		// Add to points array for ClickHouse Polygon format
-		points = append(points, fmt.Sprintf("(%.6f, %.6f)", lon, lat))
-
-		// Calculate bounding box
-		if i == 0 {
-			minLat, maxLat = lat, lat
-			minLon, maxLon = lon, lon
-		} else {
-			minLat = math.Min(minLat, lat)
-			maxLat = math.Max(maxLat, lat)
-			minLon = math.Min(minLon, lon)
-			maxLon = math.Max(maxLon, lon)
-		}
-	}
-
-	// Format polygon for ClickHouse
-	clickhousePolygon := fmt.Sprintf("[%s]", strings.Join(points, ", "))
-
-	bbox := BoundingBox{
-		MinLat: minLat,
-		MaxLat: maxLat,
-		MinLon: minLon,
-		MaxLon: maxLon,
-	}
-
-	return clickhousePolygon, bbox, nil
+	// Outer ring only
+	return [][][2]float64{points}, nil
 }
 
 func extractCampaignID(filename string) string {
-	// Remove .csv extension
 	name := strings.TrimSuffix(filename, ".csv")
-
-	// Remove "Geocoded_Locations - " prefix if present
 	if strings.HasPrefix(name, "Geocoded_Locations - ") {
 		name = strings.TrimPrefix(name, "Geocoded_Locations - ")
 	}
-
-	// Clean up the campaign ID
-	campaignID := strings.TrimSpace(name)
-
-	return campaignID
+	return strings.TrimSpace(name)
 }
 
 func findColumnIndices(headers []string) (addressIndex, geometryIndex int) {
 	addressIndex = -1
 	geometryIndex = -1
-
 	for i, header := range headers {
 		header = strings.ToLower(strings.TrimSpace(header))
 		switch header {
@@ -306,76 +236,35 @@ func findColumnIndices(headers []string) (addressIndex, geometryIndex int) {
 			geometryIndex = i
 		}
 	}
-
 	return addressIndex, geometryIndex
 }
 
 func insertCampaignData(db *sql.DB, data []CampaignData) error {
-	// Updated insert statement using ClickHouse polygon functions
-	insertSQL := `INSERT INTO campaigns (campaign_id, address, geometry, polygon, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon) VALUES (?, ?, ?, readWKTPolygon(?), ?, ?, ?, ?)`
+	insertSQL := `INSERT INTO campaigns (campaign_id, address, geometry, polygon) VALUES (?, ?, ?, ?)`
 
-	// Begin transaction for better performance
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// Prepare statement
 	stmt, err := tx.Prepare(insertSQL)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
-	// Insert each record with all fields
 	for _, record := range data {
 		_, err := stmt.Exec(
 			record.CampaignID,
 			record.Address,
 			record.Geometry,
-			record.Geometry, // Use original WKT for readWKTPolygon function
-			record.BBoxMinLat,
-			record.BBoxMaxLat,
-			record.BBoxMinLon,
-			record.BBoxMaxLon,
+			record.Polygon, // Proper Polygon type
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert record: %v", err)
 		}
 	}
 
-	// Commit transaction
 	return tx.Commit()
-}
-
-// Alternative batch insert method for better performance with large datasets
-func insertCampaignDataBatch(db *sql.DB, data []CampaignData) error {
-	if len(data) == 0 {
-		return nil
-	}
-
-	// Build bulk insert query with ClickHouse polygon function
-	valueStrings := make([]string, 0, len(data))
-	valueArgs := make([]interface{}, 0, len(data)*8)
-
-	for _, record := range data {
-		valueStrings = append(valueStrings, "(?, ?, ?, readWKTPolygon(?), ?, ?, ?, ?)")
-		valueArgs = append(valueArgs,
-			record.CampaignID,
-			record.Address,
-			record.Geometry,
-			record.Geometry, // Use original WKT for readWKTPolygon function
-			record.BBoxMinLat,
-			record.BBoxMaxLat,
-			record.BBoxMinLon,
-			record.BBoxMaxLon,
-		)
-	}
-
-	query := fmt.Sprintf("INSERT INTO campaigns (campaign_id, address, geometry, polygon, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon) VALUES %s",
-		strings.Join(valueStrings, ","))
-
-	_, err := db.Exec(query, valueArgs...)
-	return err
 }
