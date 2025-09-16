@@ -311,8 +311,8 @@ func findColumnIndices(headers []string) (addressIndex, geometryIndex int) {
 }
 
 func insertCampaignData(db *sql.DB, data []CampaignData) error {
-	// Updated insert statement to include all fields including parsed polygon and bounding box
-	insertSQL := `INSERT INTO campaigns (campaign_id, address, geometry, polygon, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	// Updated insert statement using ClickHouse polygon functions
+	insertSQL := `INSERT INTO campaigns (campaign_id, address, geometry, polygon, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon) VALUES (?, ?, ?, readWKTPolygon(?), ?, ?, ?, ?)`
 
 	// Begin transaction for better performance
 	tx, err := db.Begin()
@@ -334,7 +334,7 @@ func insertCampaignData(db *sql.DB, data []CampaignData) error {
 			record.CampaignID,
 			record.Address,
 			record.Geometry,
-			record.Polygon,
+			record.Geometry, // Use original WKT for readWKTPolygon function
 			record.BBoxMinLat,
 			record.BBoxMaxLat,
 			record.BBoxMinLon,
@@ -355,17 +355,17 @@ func insertCampaignDataBatch(db *sql.DB, data []CampaignData) error {
 		return nil
 	}
 
-	// Build bulk insert query with all fields
+	// Build bulk insert query with ClickHouse polygon function
 	valueStrings := make([]string, 0, len(data))
 	valueArgs := make([]interface{}, 0, len(data)*8)
 
 	for _, record := range data {
-		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?, ?, ?)")
+		valueStrings = append(valueStrings, "(?, ?, ?, readWKTPolygon(?), ?, ?, ?, ?)")
 		valueArgs = append(valueArgs,
 			record.CampaignID,
 			record.Address,
 			record.Geometry,
-			record.Polygon,
+			record.Geometry, // Use original WKT for readWKTPolygon function
 			record.BBoxMinLat,
 			record.BBoxMaxLat,
 			record.BBoxMinLon,
