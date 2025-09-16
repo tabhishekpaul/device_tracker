@@ -33,7 +33,7 @@ func main() {
 	}
 	defer tracker.Close()
 
-	startDateStr := "2025-08-23"
+	startDateStr := "2025-09-15"
 	startDate, err := time.Parse("2006-01-02", startDateStr)
 	if err != nil {
 		panic(err)

@@ -44,16 +44,6 @@ type DeviceTracker struct {
 	logger *log.Logger
 }
 
-type IdleDevice struct {
-	DeviceID     string
-	CampaignID   string
-	CampaignAddr string
-	Latitude     float64
-	Longitude    float64
-	VisitedTime  time.Time
-	PingCount    int64
-}
-
 type ConsumerMatch struct {
 	DeviceID    string `json:"device_id"`
 	DateVisited string `json:"date_visited"`
@@ -77,18 +67,23 @@ func NewDeviceTracker(config Config) (*DeviceTracker, error) {
 			Password: config.ClickHouse.Password,
 		},
 		Settings: clickhouse.Settings{
-			"max_execution_time":                   7200,
-			"max_memory_usage":                     80000000000,
-			"max_bytes_before_external_group_by":   30000000000,
-			"max_bytes_before_external_sort":       30000000000,
-			"join_algorithm":                       "hash",
-			"max_block_size":                       65536,
-			"preferred_block_size_bytes":           1000000,
-			"join_use_nulls":                       1,
-			"enable_optimize_predicate_expression": 0,
-			"max_threads":                          16,
+			// Optimized for 16B rows
+			"max_execution_time":                       14400,          // 4 hours
+			"max_memory_usage":                         "200000000000", // 200GB
+			"max_bytes_before_external_group_by":       "100000000000", // 100GB
+			"max_bytes_before_external_sort":           "100000000000", // 100GB
+			"join_algorithm":                           "hash",
+			"max_block_size":                           1048576,  // 1M rows per block
+			"preferred_block_size_bytes":               10000000, // 10MB
+			"join_use_nulls":                           1,
+			"enable_optimize_predicate_expression":     1,
+			"max_threads":                              0,             // Use all available cores
+			"max_bytes_before_remerge_sort":            "50000000000", // 50GB
+			"distributed_aggregation_memory_efficient": 1,
+			"optimize_skip_unused_shards":              1,
+			"use_index_for_in_with_subqueries":         1,
 		},
-		DialTimeout: 60 * time.Second,
+		DialTimeout: 300 * time.Second, // 5 minutes
 	})
 
 	if err != nil {
@@ -110,30 +105,17 @@ func NewDeviceTracker(config Config) (*DeviceTracker, error) {
 
 func (dt *DeviceTracker) RunCampaignConsumerAnalysis(ctx context.Context, targetDates []string) error {
 	startTime := time.Now()
-	dt.logger.Println("Starting campaign-based consumer analysis...")
+	dt.logger.Println("Starting optimized single-query campaign consumer analysis...")
 
-	// Step 1: Find devices within campaign polygons during 2am-6am
-	idleDevices, err := dt.findIdleDevicesInCampaigns(ctx, targetDates)
+	// Execute single comprehensive query
+	matches, err := dt.executeOptimizedQuery(ctx, targetDates)
 	if err != nil {
-		return fmt.Errorf("failed to find idle devices in campaigns: %w", err)
-	}
-
-	dt.logger.Printf("Found %d idle devices in campaign areas", len(idleDevices))
-
-	if len(idleDevices) == 0 {
-		dt.logger.Println("No idle devices found in campaign areas. Exiting.")
-		return nil
-	}
-
-	// Step 2: Find consumers within radius of idle devices
-	matches, err := dt.findConsumersNearIdleDevices(ctx, idleDevices)
-	if err != nil {
-		return fmt.Errorf("failed to find consumers near idle devices: %w", err)
+		return fmt.Errorf("failed to execute optimized query: %w", err)
 	}
 
 	dt.logger.Printf("Found %d consumer matches", len(matches))
 
-	// Step 3: Export results
+	// Export results
 	err = dt.exportResults(matches)
 	if err != nil {
 		return fmt.Errorf("failed to export results: %w", err)
@@ -145,12 +127,13 @@ func (dt *DeviceTracker) RunCampaignConsumerAnalysis(ctx context.Context, target
 	return nil
 }
 
-func (dt *DeviceTracker) findIdleDevicesInCampaigns(ctx context.Context, targetDates []string) ([]IdleDevice, error) {
+func (dt *DeviceTracker) executeOptimizedQuery(ctx context.Context, targetDates []string) ([]ConsumerMatch, error) {
 	dateFilter := "'" + strings.Join(targetDates, "','") + "'"
 
+	// Single comprehensive query that does everything server-side
 	query := fmt.Sprintf(`
 	WITH 
-	-- Step 1: Filter device data by date and time (2am-6am)
+	-- Step 1: Pre-filter device data by date and time (2am-6am) with partitioning
 	time_filtered_devices AS (
 		SELECT 
 			device_id,
@@ -160,10 +143,15 @@ func (dt *DeviceTracker) findIdleDevicesInCampaigns(ctx context.Context, targetD
 			load_date
 		FROM device_data
 		WHERE load_date IN (%s)
-		  AND toHour(event_timestamp) >= 2 AND toHour(event_timestamp) < 6
+		  AND toHour(event_timestamp) >= 2 
+		  AND toHour(event_timestamp) < 6
+		  AND latitude != 0 
+		  AND longitude != 0
+		  AND latitude IS NOT NULL 
+		  AND longitude IS NOT NULL
 	),
 	
-	-- Step 2: Find devices within campaign polygons
+	-- Step 2: Find devices within campaign polygons (optimized with spatial index)
 	devices_in_campaigns AS (
 		SELECT 
 			tfd.device_id,
@@ -173,218 +161,122 @@ func (dt *DeviceTracker) findIdleDevicesInCampaigns(ctx context.Context, targetD
 			c.campaign_id,
 			c.address as campaign_address
 		FROM time_filtered_devices tfd
-		CROSS JOIN campaigns c
-		WHERE pointInPolygon((tfd.longitude, tfd.latitude), c.polygon)
+		INNER JOIN campaigns c ON pointInPolygon((tfd.longitude, tfd.latitude), c.polygon)
 	),
 	
-	-- Step 3: Identify idle devices
-	device_movement_analysis AS (
+	-- Step 3: Aggregate and identify idle devices
+	idle_devices AS (
 		SELECT 
 			device_id,
 			campaign_id,
 			campaign_address,
 			avg(latitude) as avg_latitude,
 			avg(longitude) as avg_longitude,
-			min(event_timestamp) as first_seen,
+			min(event_timestamp) as visited_time,
 			count(*) as ping_count,
 			stddevPop(latitude) as lat_stddev,
 			stddevPop(longitude) as lng_stddev
 		FROM devices_in_campaigns
 		GROUP BY device_id, campaign_id, campaign_address
+		HAVING ping_count >= %d
+		   AND (lat_stddev IS NULL OR lat_stddev < %f)
+		   AND (lng_stddev IS NULL OR lng_stddev < %f)
 	),
 	
-	-- Step 4: Filter for truly idle devices
-	idle_devices_final AS (
+	-- Step 4: Find consumers near idle devices in single join
+	consumer_matches AS (
 		SELECT 
-			device_id,
-			campaign_id,
-			campaign_address,
-			avg_latitude as latitude,
-			avg_longitude as longitude,
-			first_seen as visited_time,
-			ping_count
-		FROM device_movement_analysis
-		WHERE ping_count >= %d
-		  AND (lat_stddev IS NULL OR lat_stddev < %f)
-		  AND (lng_stddev IS NULL OR lng_stddev < %f)
+			i.device_id,
+			i.campaign_id,
+			i.campaign_address,
+			i.visited_time,
+			c.id as consumer_id,
+			concat(c.PersonFirstName, ' ', c.PersonLastName) as name,
+			c.PrimaryAddress as address,
+			c.Email as email,
+			c.CityName as city,
+			c.State as state,
+			c.ZipCode as zip_code,
+			geoDistance(i.avg_longitude, i.avg_latitude, c.longitude, c.latitude) as distance_meters,
+			-- Add row number to get closest consumer per device
+			ROW_NUMBER() OVER (
+				PARTITION BY i.device_id, i.campaign_id 
+				ORDER BY geoDistance(i.avg_longitude, i.avg_latitude, c.longitude, c.latitude)
+			) as rn
+		FROM idle_devices i
+		INNER JOIN consumers c ON (
+			c.latitude != 0 AND c.longitude != 0 
+			AND c.latitude IS NOT NULL AND c.longitude IS NOT NULL
+			AND geoDistance(i.avg_longitude, i.avg_latitude, c.longitude, c.latitude) <= %f
+		)
 	)
 	
+	-- Final result: Get only the closest consumer per device
 	SELECT 
 		device_id,
-		campaign_id,
-		campaign_address,
-		latitude,
-		longitude,
-		visited_time,
-		ping_count
-	FROM idle_devices_final
-	ORDER BY visited_time DESC`,
+		formatDateTime(visited_time, '%%Y-%%m-%%d') as date_visited,
+		formatDateTime(visited_time, '%%H:%%M:%%S') as time_visited,
+		name,
+		address,
+		email,
+		campaign_address as poi,
+		campaign_id as campaign,
+		city as city_name,
+		state,
+		zip_code
+	FROM consumer_matches
+	WHERE rn = 1
+	ORDER BY campaign_id, visited_time DESC`,
 		dateFilter,
 		dt.config.Processing.MinIdlePings,
 		dt.config.Processing.MovementThreshold,
-		dt.config.Processing.MovementThreshold)
-
-	dt.logger.Println("Executing query to find idle devices in campaigns...")
-
-	rows, err := dt.conn.Query(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute idle devices query: %w", err)
-	}
-	defer rows.Close()
-
-	var idleDevices []IdleDevice
-	for rows.Next() {
-		var device IdleDevice
-		var visitedTime time.Time
-
-		err := rows.Scan(
-			&device.DeviceID,
-			&device.CampaignID,
-			&device.CampaignAddr,
-			&device.Latitude,
-			&device.Longitude,
-			&visitedTime,
-			&device.PingCount,
-		)
-		if err != nil {
-			dt.logger.Printf("Warning: Failed to scan idle device row: %v", err)
-			continue
-		}
-
-		device.VisitedTime = visitedTime
-		idleDevices = append(idleDevices, device)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-
-	return idleDevices, nil
-}
-
-func (dt *DeviceTracker) findConsumersNearIdleDevices(ctx context.Context, idleDevices []IdleDevice) ([]ConsumerMatch, error) {
-	if len(idleDevices) == 0 {
-		return []ConsumerMatch{}, nil
-	}
-
-	// Check if consumers table has valid coordinates
-	var validConsumerCount uint64
-	checkQuery := `SELECT count() FROM consumers WHERE latitude != 0 AND longitude != 0 AND latitude IS NOT NULL AND longitude IS NOT NULL`
-
-	row := dt.conn.QueryRow(ctx, checkQuery)
-	if err := row.Scan(&validConsumerCount); err != nil {
-		dt.logger.Printf("Warning: Failed to check valid consumer coordinates: %v", err)
-		validConsumerCount = 0
-	}
-
-	dt.logger.Printf("Found %d consumers with valid coordinates", validConsumerCount)
-
-	if validConsumerCount == 0 {
-		dt.logger.Println("No consumers with valid coordinates found")
-		// Return idle devices without consumer matches
-		var matches []ConsumerMatch
-		for _, device := range idleDevices {
-			match := ConsumerMatch{
-				DeviceID:    device.DeviceID,
-				DateVisited: device.VisitedTime.Format("2006-01-02"),
-				TimeVisited: device.VisitedTime.Format("15:04:05"),
-				Name:        "",
-				Address:     "",
-				Email:       "",
-				POI:         device.CampaignAddr,
-				Campaign:    device.CampaignID,
-				CityName:    "",
-				State:       "",
-				ZipCode:     "",
-			}
-			matches = append(matches, match)
-		}
-		return matches, nil
-	}
-
-	// Build device location conditions for the query
-	var deviceConditions []string
-	for _, device := range idleDevices {
-		condition := fmt.Sprintf("(%.6f, %.6f, '%s', '%s', '%s', '%s')",
-			device.Latitude, device.Longitude, device.DeviceID, device.CampaignID,
-			device.CampaignAddr, device.VisitedTime.Format("2006-01-02 15:04:05"))
-		deviceConditions = append(deviceConditions, condition)
-	}
-
-	query := fmt.Sprintf(`
-	WITH device_locations AS (
-		SELECT * FROM VALUES('latitude Float64, longitude Float64, device_id String, campaign_id String, campaign_addr String, visited_time String',
-			%s
-		)
-	)
-	SELECT 
-		dl.device_id,
-		dl.campaign_id,
-		dl.campaign_addr,
-		dl.visited_time,
-		c.id as consumer_id,
-		concat(c.PersonFirstName, ' ', c.PersonLastName) as name,
-		c.PrimaryAddress as address,
-		c.Email as email,
-		c.CityName as city,
-		c.State as state,
-		c.ZipCode as zip_code,
-		geoDistance(dl.longitude, dl.latitude, c.longitude, c.latitude) as distance_meters
-	FROM device_locations dl
-	INNER JOIN consumers c ON (
-		c.latitude != 0 AND c.longitude != 0 
-		AND c.latitude IS NOT NULL AND c.longitude IS NOT NULL
-		AND geoDistance(dl.longitude, dl.latitude, c.longitude, c.latitude) <= %f
-	)
-	ORDER BY dl.campaign_id, dl.device_id, distance_meters`,
-		strings.Join(deviceConditions, ","),
+		dt.config.Processing.MovementThreshold,
 		dt.config.Processing.SearchRadius)
 
-	dt.logger.Println("Executing query to find consumers near idle devices...")
+	dt.logger.Println("Executing optimized single query for 16B rows...")
+	dt.logger.Printf("Query settings: max_memory=200GB, external_sort/group_by=100GB, timeout=4h")
 
-	rows, err := dt.conn.Query(ctx, query)
+	// Use a context with timeout for very long queries
+	queryCtx, cancel := context.WithTimeout(ctx, 4*time.Hour)
+	defer cancel()
+
+	rows, err := dt.conn.Query(queryCtx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute consumer search query: %w", err)
+		return nil, fmt.Errorf("failed to execute optimized query: %w", err)
 	}
 	defer rows.Close()
 
 	var matches []ConsumerMatch
+	count := 0
+
 	for rows.Next() {
-		var deviceID, campaignID, campaignAddr, visitedTimeStr string
-		var consumerID int64
-		var name, address, email, city, state, zipCode string
-		var distance float64
+		var match ConsumerMatch
 
 		err := rows.Scan(
-			&deviceID, &campaignID, &campaignAddr, &visitedTimeStr,
-			&consumerID, &name, &address, &email, &city, &state, &zipCode, &distance,
+			&match.DeviceID,
+			&match.DateVisited,
+			&match.TimeVisited,
+			&match.Name,
+			&match.Address,
+			&match.Email,
+			&match.POI,
+			&match.Campaign,
+			&match.CityName,
+			&match.State,
+			&match.ZipCode,
 		)
 		if err != nil {
 			dt.logger.Printf("Warning: Failed to scan consumer match row: %v", err)
 			continue
 		}
 
-		// Parse visited time
-		visitedTime, err := time.Parse("2006-01-02 15:04:05", visitedTimeStr)
-		if err != nil {
-			dt.logger.Printf("Warning: Failed to parse visited time %s: %v", visitedTimeStr, err)
-			visitedTime = time.Now()
-		}
-
-		match := ConsumerMatch{
-			DeviceID:    deviceID,
-			DateVisited: visitedTime.Format("2006-01-02"),
-			TimeVisited: visitedTime.Format("15:04:05"),
-			Name:        name,
-			Address:     address,
-			Email:       email,
-			POI:         campaignAddr,
-			Campaign:    campaignID,
-			CityName:    city,
-			State:       state,
-			ZipCode:     zipCode,
-		}
 		matches = append(matches, match)
+		count++
+
+		// Progress logging for large datasets
+		if count%100000 == 0 {
+			dt.logger.Printf("Processed %d records...", count)
+		}
 	}
 
 	if err := rows.Err(); err != nil {
@@ -429,20 +321,24 @@ func (dt *DeviceTracker) exportResults(matches []ConsumerMatch) error {
 }
 
 func (dt *DeviceTracker) exportCampaignResults(outputDir, campaignID string, matches []ConsumerMatch) error {
+	// Clean campaign ID for filesystem compatibility
+	cleanCampaignID := strings.ReplaceAll(campaignID, " ", "_")
+	cleanCampaignID = strings.ReplaceAll(cleanCampaignID, "/", "_")
+
 	// Create campaign subdirectory
-	campaignDir := filepath.Join(outputDir, campaignID)
+	campaignDir := filepath.Join(outputDir, cleanCampaignID)
 	if err := os.MkdirAll(campaignDir, 0755); err != nil {
 		return fmt.Errorf("failed to create campaign directory: %w", err)
 	}
 
 	// Export CSV
-	csvPath := filepath.Join(campaignDir, fmt.Sprintf("%s_consumers.csv", campaignID))
+	csvPath := filepath.Join(campaignDir, fmt.Sprintf("%s_consumers.csv", cleanCampaignID))
 	if err := dt.exportCSV(csvPath, matches); err != nil {
 		return fmt.Errorf("failed to export CSV for campaign %s: %w", campaignID, err)
 	}
 
 	// Export JSON
-	jsonPath := filepath.Join(campaignDir, fmt.Sprintf("%s_consumers.json", campaignID))
+	jsonPath := filepath.Join(campaignDir, fmt.Sprintf("%s_consumers.json", cleanCampaignID))
 	if err := dt.exportJSON(jsonPath, matches); err != nil {
 		return fmt.Errorf("failed to export JSON for campaign %s: %w", campaignID, err)
 	}
