@@ -44,8 +44,8 @@ func main() {
 		CHPassword: "nyros",
 	}
 
-	// Replace with your root directory path containing subdirectories with CSV files
-	rootDir := "./campaign_data"
+	// Updated root directory path
+	rootDir := "/mnt/blobcontainer/Geocoded"
 
 	if err := processDirectory(rootDir, config); err != nil {
 		log.Fatalf("Error processing directory: %v", err)
@@ -311,8 +311,8 @@ func findColumnIndices(headers []string) (addressIndex, geometryIndex int) {
 }
 
 func insertCampaignData(db *sql.DB, data []CampaignData) error {
-	// Prepare batch insert statement
-	insertSQL := `INSERT INTO campaigns (campaign_id, address, geometry) VALUES (?, ?, ?)`
+	// Updated insert statement to include all fields including parsed polygon and bounding box
+	insertSQL := `INSERT INTO campaigns (campaign_id, address, geometry, polygon, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 
 	// Begin transaction for better performance
 	tx, err := db.Begin()
@@ -328,9 +328,18 @@ func insertCampaignData(db *sql.DB, data []CampaignData) error {
 	}
 	defer stmt.Close()
 
-	// Insert each record
+	// Insert each record with all fields
 	for _, record := range data {
-		_, err := stmt.Exec(record.CampaignID, record.Address, record.Geometry)
+		_, err := stmt.Exec(
+			record.CampaignID,
+			record.Address,
+			record.Geometry,
+			record.Polygon,
+			record.BBoxMinLat,
+			record.BBoxMaxLat,
+			record.BBoxMinLon,
+			record.BBoxMaxLon,
+		)
 		if err != nil {
 			return fmt.Errorf("failed to insert record: %v", err)
 		}
@@ -346,16 +355,25 @@ func insertCampaignDataBatch(db *sql.DB, data []CampaignData) error {
 		return nil
 	}
 
-	// Build bulk insert query
+	// Build bulk insert query with all fields
 	valueStrings := make([]string, 0, len(data))
-	valueArgs := make([]interface{}, 0, len(data)*3)
+	valueArgs := make([]interface{}, 0, len(data)*8)
 
 	for _, record := range data {
-		valueStrings = append(valueStrings, "(?, ?, ?)")
-		valueArgs = append(valueArgs, record.CampaignID, record.Address, record.Geometry)
+		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?, ?, ?)")
+		valueArgs = append(valueArgs,
+			record.CampaignID,
+			record.Address,
+			record.Geometry,
+			record.Polygon,
+			record.BBoxMinLat,
+			record.BBoxMaxLat,
+			record.BBoxMinLon,
+			record.BBoxMaxLon,
+		)
 	}
 
-	query := fmt.Sprintf("INSERT INTO campaigns (campaign_id, address, geometry) VALUES %s",
+	query := fmt.Sprintf("INSERT INTO campaigns (campaign_id, address, geometry, polygon, bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon) VALUES %s",
 		strings.Join(valueStrings, ","))
 
 	_, err := db.Exec(query, valueArgs...)
