@@ -45,7 +45,7 @@ func main() {
 	}
 
 	// Replace with your root directory path containing subdirectories with CSV files
-	rootDir := "/mnt/blobcontainer/Geocoded"
+	rootDir := "./campaign_data"
 
 	if err := processDirectory(rootDir, config); err != nil {
 		log.Fatalf("Error processing directory: %v", err)
@@ -115,6 +115,11 @@ func createTable(db *sql.DB) error {
 		campaign_id String,
 		address String,
 		geometry String,
+		polygon Polygon,
+		bbox_min_lat Float64,
+		bbox_max_lat Float64,
+		bbox_min_lon Float64,
+		bbox_max_lon Float64,
 		created_at DateTime DEFAULT now()
 	) ENGINE = MergeTree()
 	ORDER BY (campaign_id, created_at)
@@ -278,8 +283,8 @@ func extractCampaignID(filename string) string {
 	name := strings.TrimSuffix(filename, ".csv")
 
 	// Remove "Geocoded_Locations - " prefix if present
-	if after, ok := strings.CutPrefix(name, "Geocoded_Locations - "); ok {
-		name = after
+	if strings.HasPrefix(name, "Geocoded_Locations - ") {
+		name = strings.TrimPrefix(name, "Geocoded_Locations - ")
 	}
 
 	// Clean up the campaign ID
@@ -333,4 +338,26 @@ func insertCampaignData(db *sql.DB, data []CampaignData) error {
 
 	// Commit transaction
 	return tx.Commit()
+}
+
+// Alternative batch insert method for better performance with large datasets
+func insertCampaignDataBatch(db *sql.DB, data []CampaignData) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	// Build bulk insert query
+	valueStrings := make([]string, 0, len(data))
+	valueArgs := make([]interface{}, 0, len(data)*3)
+
+	for _, record := range data {
+		valueStrings = append(valueStrings, "(?, ?, ?)")
+		valueArgs = append(valueArgs, record.CampaignID, record.Address, record.Geometry)
+	}
+
+	query := fmt.Sprintf("INSERT INTO campaigns (campaign_id, address, geometry) VALUES %s",
+		strings.Join(valueStrings, ","))
+
+	_, err := db.Exec(query, valueArgs...)
+	return err
 }
