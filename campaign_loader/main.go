@@ -189,8 +189,11 @@ func processCSVFile(filePath string, db *sql.DB) error {
 }
 
 func parseWKTPolygon(wkt string) ([][][2]float64, error) {
-	// Expect POLYGON ((x y, x y, ...))
 	wkt = strings.TrimSpace(wkt)
+	wkt = strings.ToUpper(wkt) // normalize casing just in case
+
+	// Remove POLYGON wrapper safely
+	wkt = strings.TrimPrefix(wkt, "POLYGON((")
 	wkt = strings.TrimPrefix(wkt, "POLYGON ((")
 	wkt = strings.TrimSuffix(wkt, "))")
 
@@ -212,7 +215,7 @@ func parseWKTPolygon(wkt string) ([][][2]float64, error) {
 		points = append(points, [2]float64{x, y})
 	}
 
-	// Outer ring only
+	// Return as outer ring
 	return [][][2]float64{points}, nil
 }
 
