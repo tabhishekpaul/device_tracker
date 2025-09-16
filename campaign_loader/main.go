@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	_ "github.com/ClickHouse/clickhouse-go/v2"
@@ -207,13 +210,76 @@ func processCSVFile(filePath string, db *sql.DB) error {
 	return nil
 }
 
+// BoundingBox represents the bounding box of a polygon
+type BoundingBox struct {
+	MinLat, MaxLat, MinLon, MaxLon float64
+}
+
+// parsePolygonAndBBox parses WKT POLYGON and extracts bounding box
+func parsePolygonAndBBox(wktPolygon string) (string, BoundingBox, error) {
+	// Remove POLYGON and parentheses to get coordinate pairs
+	re := regexp.MustCompile(`POLYGON\s*\(\s*\((.*?)\)\s*\)`)
+	matches := re.FindStringSubmatch(wktPolygon)
+	if len(matches) < 2 {
+		return "", BoundingBox{}, fmt.Errorf("invalid POLYGON format: %s", wktPolygon)
+	}
+
+	coordsStr := matches[1]
+	coordPairs := strings.Split(coordsStr, ",")
+
+	var minLat, maxLat, minLon, maxLon float64
+	var points []string
+
+	for i, pair := range coordPairs {
+		coords := strings.Fields(strings.TrimSpace(pair))
+		if len(coords) != 2 {
+			continue
+		}
+
+		lon, err := strconv.ParseFloat(coords[0], 64)
+		if err != nil {
+			continue
+		}
+		lat, err := strconv.ParseFloat(coords[1], 64)
+		if err != nil {
+			continue
+		}
+
+		// Add to points array for ClickHouse Polygon format
+		points = append(points, fmt.Sprintf("(%.6f, %.6f)", lon, lat))
+
+		// Calculate bounding box
+		if i == 0 {
+			minLat, maxLat = lat, lat
+			minLon, maxLon = lon, lon
+		} else {
+			minLat = math.Min(minLat, lat)
+			maxLat = math.Max(maxLat, lat)
+			minLon = math.Min(minLon, lon)
+			maxLon = math.Max(maxLon, lon)
+		}
+	}
+
+	// Format polygon for ClickHouse
+	clickhousePolygon := fmt.Sprintf("[%s]", strings.Join(points, ", "))
+
+	bbox := BoundingBox{
+		MinLat: minLat,
+		MaxLat: maxLat,
+		MinLon: minLon,
+		MaxLon: maxLon,
+	}
+
+	return clickhousePolygon, bbox, nil
+}
+
 func extractCampaignID(filename string) string {
 	// Remove .csv extension
 	name := strings.TrimSuffix(filename, ".csv")
 
 	// Remove "Geocoded_Locations - " prefix if present
-	if strings.HasPrefix(name, "Geocoded_Locations - ") {
-		name = strings.TrimPrefix(name, "Geocoded_Locations - ")
+	if after, ok := strings.CutPrefix(name, "Geocoded_Locations - "); ok {
+		name = after
 	}
 
 	// Clean up the campaign ID
@@ -267,26 +333,4 @@ func insertCampaignData(db *sql.DB, data []CampaignData) error {
 
 	// Commit transaction
 	return tx.Commit()
-}
-
-// Alternative batch insert method for better performance with large datasets
-func insertCampaignDataBatch(db *sql.DB, data []CampaignData) error {
-	if len(data) == 0 {
-		return nil
-	}
-
-	// Build bulk insert query
-	valueStrings := make([]string, 0, len(data))
-	valueArgs := make([]interface{}, 0, len(data)*3)
-
-	for _, record := range data {
-		valueStrings = append(valueStrings, "(?, ?, ?)")
-		valueArgs = append(valueArgs, record.CampaignID, record.Address, record.Geometry)
-	}
-
-	query := fmt.Sprintf("INSERT INTO campaigns (campaign_id, address, geometry) VALUES %s",
-		strings.Join(valueStrings, ","))
-
-	_, err := db.Exec(query, valueArgs...)
-	return err
 }
