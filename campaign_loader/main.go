@@ -26,7 +26,7 @@ type CampaignData struct {
 	CampaignID string
 	Address    string
 	Geometry   string
-	Polygon    [][2]float64 // Simple slice for ClickHouse Array(Tuple(Float64, Float64))
+	Polygon    [][]interface{} // Array of interfaces for ClickHouse Array(Tuple(Float64, Float64))
 }
 
 func main() {
@@ -188,7 +188,7 @@ func processCSVFile(filePath string, db *sql.DB) error {
 	return nil
 }
 
-func parseWKTPolygon(wkt string) ([][2]float64, error) {
+func parseWKTPolygon(wkt string) ([][]interface{}, error) {
 	wkt = strings.TrimSpace(wkt)
 	wkt = strings.ToUpper(wkt)
 
@@ -198,7 +198,7 @@ func parseWKTPolygon(wkt string) ([][2]float64, error) {
 	wkt = strings.TrimSuffix(wkt, "))")
 
 	coords := strings.Split(wkt, ",")
-	points := make([][2]float64, 0, len(coords))
+	points := make([][]interface{}, 0, len(coords))
 
 	for _, c := range coords {
 		parts := strings.Fields(strings.TrimSpace(c))
@@ -212,7 +212,8 @@ func parseWKTPolygon(wkt string) ([][2]float64, error) {
 			return nil, fmt.Errorf("invalid float in coord: %s", c)
 		}
 
-		points = append(points, [2]float64{x, y})
+		// Create tuple as []interface{} containing two float64 values
+		points = append(points, []interface{}{x, y})
 	}
 
 	return points, nil
@@ -261,7 +262,7 @@ func insertCampaignData(db *sql.DB, data []CampaignData) error {
 			record.CampaignID,
 			record.Address,
 			record.Geometry,
-			record.Polygon, // Now using [][2]float64 for Array(Tuple(Float64, Float64))
+			record.Polygon, // Now using [][]interface{} for Array(Tuple(Float64, Float64))
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert record: %v", err)
