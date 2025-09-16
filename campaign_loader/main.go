@@ -26,7 +26,7 @@ type CampaignData struct {
 	CampaignID string
 	Address    string
 	Geometry   string
-	Polygon    [][][2]float64 // ClickHouse Polygon type
+	Polygon    [][2]float64 // Simple slice for ClickHouse Array(Tuple(Float64, Float64))
 }
 
 func main() {
@@ -105,7 +105,7 @@ func createTable(db *sql.DB) error {
 		campaign_id String,
 		address String,
 		geometry String,
-		polygon Polygon,
+		polygon Array(Tuple(Float64, Float64)),
 		created_at DateTime DEFAULT now()
 	) ENGINE = MergeTree()
 	ORDER BY (campaign_id, created_at)
@@ -188,9 +188,9 @@ func processCSVFile(filePath string, db *sql.DB) error {
 	return nil
 }
 
-func parseWKTPolygon(wkt string) ([][][2]float64, error) {
+func parseWKTPolygon(wkt string) ([][2]float64, error) {
 	wkt = strings.TrimSpace(wkt)
-	wkt = strings.ToUpper(wkt) // normalize casing just in case
+	wkt = strings.ToUpper(wkt)
 
 	// Remove POLYGON wrapper safely
 	wkt = strings.TrimPrefix(wkt, "POLYGON((")
@@ -215,8 +215,7 @@ func parseWKTPolygon(wkt string) ([][][2]float64, error) {
 		points = append(points, [2]float64{x, y})
 	}
 
-	// Return as outer ring
-	return [][][2]float64{points}, nil
+	return points, nil
 }
 
 func extractCampaignID(filename string) string {
@@ -262,7 +261,7 @@ func insertCampaignData(db *sql.DB, data []CampaignData) error {
 			record.CampaignID,
 			record.Address,
 			record.Geometry,
-			record.Polygon, // Proper Polygon type
+			record.Polygon, // Now using [][2]float64 for Array(Tuple(Float64, Float64))
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert record: %v", err)
