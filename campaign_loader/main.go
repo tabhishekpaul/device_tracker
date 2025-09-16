@@ -25,6 +25,11 @@ type CampaignData struct {
 	CampaignID string
 	Address    string
 	Geometry   string
+	Polygon    string
+	BBoxMinLat float64
+	BBoxMaxLat float64
+	BBoxMinLon float64
+	BBoxMaxLon float64
 }
 
 func main() {
@@ -37,7 +42,7 @@ func main() {
 	}
 
 	// Replace with your root directory path containing subdirectories with CSV files
-	rootDir := "/mnt/blobcontainer/Geocoded"
+	rootDir := "./campaign_data"
 
 	if err := processDirectory(rootDir, config); err != nil {
 		log.Fatalf("Error processing directory: %v", err)
@@ -103,7 +108,7 @@ func connectClickHouse(config Config) (*sql.DB, error) {
 
 func createTable(db *sql.DB) error {
 	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS device_tracking.campaigns (
+	CREATE TABLE IF NOT EXISTS campaigns (
 		campaign_id String,
 		address String,
 		geometry String,
@@ -172,10 +177,22 @@ func processCSVFile(filePath string, db *sql.DB) error {
 			continue
 		}
 
+		// Parse polygon and calculate bounding box
+		polygon, bbox, err := parsePolygonAndBBox(geometry)
+		if err != nil {
+			log.Printf("Error parsing geometry for address %s: %v", address, err)
+			continue
+		}
+
 		campaignData = append(campaignData, CampaignData{
 			CampaignID: campaignID,
 			Address:    address,
 			Geometry:   geometry,
+			Polygon:    polygon,
+			BBoxMinLat: bbox.MinLat,
+			BBoxMaxLat: bbox.MaxLat,
+			BBoxMinLon: bbox.MinLon,
+			BBoxMaxLon: bbox.MaxLon,
 		})
 	}
 
@@ -195,8 +212,8 @@ func extractCampaignID(filename string) string {
 	name := strings.TrimSuffix(filename, ".csv")
 
 	// Remove "Geocoded_Locations - " prefix if present
-	if after, ok := strings.CutPrefix(name, "Geocoded_Locations - "); ok {
-		name = after
+	if strings.HasPrefix(name, "Geocoded_Locations - ") {
+		name = strings.TrimPrefix(name, "Geocoded_Locations - ")
 	}
 
 	// Clean up the campaign ID
@@ -224,7 +241,7 @@ func findColumnIndices(headers []string) (addressIndex, geometryIndex int) {
 
 func insertCampaignData(db *sql.DB, data []CampaignData) error {
 	// Prepare batch insert statement
-	insertSQL := `INSERT INTO device_tracking.campaigns (campaign_id, address, geometry) VALUES (?, ?, ?)`
+	insertSQL := `INSERT INTO campaigns (campaign_id, address, geometry) VALUES (?, ?, ?)`
 
 	// Begin transaction for better performance
 	tx, err := db.Begin()
@@ -267,7 +284,7 @@ func insertCampaignDataBatch(db *sql.DB, data []CampaignData) error {
 		valueArgs = append(valueArgs, record.CampaignID, record.Address, record.Geometry)
 	}
 
-	query := fmt.Sprintf("INSERT INTO device_tracking.campaigns (campaign_id, address, geometry) VALUES %s",
+	query := fmt.Sprintf("INSERT INTO campaigns (campaign_id, address, geometry) VALUES %s",
 		strings.Join(valueStrings, ","))
 
 	_, err := db.Exec(query, valueArgs...)
