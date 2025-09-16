@@ -324,20 +324,55 @@ func (loader *ParquetToClickHouseLoader) calculateFileHash(filePath string) (str
 	}
 	defer file.Close()
 
-	hash := md5.New()
-	// Use larger buffer for faster hashing
-	buffer := make([]byte, 1024*1024) // 1MB buffer
+	// Get file info to optimize hash calculation
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	fileSize := fileInfo.Size()
 
-	for {
-		n, err := file.Read(buffer)
-		if n > 0 {
-			hash.Write(buffer[:n])
+	hash := md5.New()
+
+	// For large files, use a larger buffer and sample-based hashing for speed
+	var buffer []byte
+	if fileSize > 100*1024*1024 { // > 100MB
+		// For very large files, use sample-based hashing for speed
+		buffer = make([]byte, 8*1024*1024) // 8MB buffer
+
+		// Hash first 1MB, middle 1MB, and last 1MB for quick comparison
+		positions := []int64{0, fileSize/2 - 512*1024, fileSize - 1024*1024}
+		for _, pos := range positions {
+			if pos < 0 {
+				pos = 0
+			}
+			file.Seek(pos, 0)
+			n, err := file.Read(buffer[:1024*1024]) // Read 1MB
+			if n > 0 {
+				hash.Write(buffer[:n])
+			}
+			if err != nil && err != io.EOF {
+				return "", err
+			}
 		}
-		if err == io.EOF {
-			break
+	} else {
+		// For smaller files, hash the entire file with optimized buffer
+		bufferSize := 2 * 1024 * 1024 // 2MB buffer
+		if fileSize < int64(bufferSize) {
+			bufferSize = int(fileSize)
 		}
-		if err != nil {
-			return "", err
+		buffer = make([]byte, bufferSize)
+
+		for {
+			n, err := file.Read(buffer)
+			if n > 0 {
+				hash.Write(buffer[:n])
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -925,6 +960,8 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 	}
 
 	// Filter files that need processing in parallel
+	log.Printf("🔍 Starting parallel file status checking with")
+
 	var filesToProcess []struct {
 		path     string
 		loadDate time.Time
@@ -936,6 +973,8 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 			loadDate time.Time
 		}
 		needsProcessing bool
+		error           error
+		checkTime       time.Duration
 	}
 
 	checkChan := make(chan struct {
@@ -946,44 +985,105 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 	resultChan := make(chan checkResult, len(allFiles))
 
 	// Start workers to check file processing status
-	checkWorkers := runtime.NumCPU()
+	checkWorkers := runtime.NumCPU() / 2 // Use half CPUs for checking
+	if checkWorkers < 4 {
+		checkWorkers = 4
+	}
+	if checkWorkers > 16 {
+		checkWorkers = 16 // Don't use too many for file checking
+	}
+
 	var checkWg sync.WaitGroup
 
 	for i := 0; i < checkWorkers; i++ {
 		checkWg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer checkWg.Done()
+			log.Printf("🔍 Check worker %d started", workerID)
+
+			processed := 0
 			for file := range checkChan {
+				checkStart := time.Now()
 				isProcessed, _, err := loader.isFileProcessed(file.path)
+				checkDuration := time.Since(checkStart)
+
+				processed++
 				needsProcessing := err == nil && !isProcessed
-				resultChan <- checkResult{file: file, needsProcessing: needsProcessing}
+
+				resultChan <- checkResult{
+					file:            file,
+					needsProcessing: needsProcessing,
+					error:           err,
+					checkTime:       checkDuration,
+				}
+
+				// Log progress every 100 files per worker
+				if processed%100 == 0 {
+					log.Printf("🔍 Check worker %d: processed %d files, avg time per file: %.2fms",
+						workerID, processed, checkDuration.Seconds()*1000)
+				}
 			}
-		}()
+			log.Printf("🔍 Check worker %d finished: %d files processed", workerID, processed)
+		}(i)
 	}
 
 	// Send files to check
 	go func() {
-		for _, file := range allFiles {
+		log.Printf("📤 Sending %d files to check workers...", len(allFiles))
+		for i, file := range allFiles {
 			checkChan <- file
+
+			// Log progress every 1000 files
+			if (i+1)%1000 == 0 {
+				log.Printf("📤 Queued %d/%d files for checking", i+1, len(allFiles))
+			}
 		}
 		close(checkChan)
+		log.Printf("📤 All %d files queued for checking", len(allFiles))
 	}()
 
 	// Close result channel when all checks are done
 	go func() {
 		checkWg.Wait()
 		close(resultChan)
+		log.Printf("🔍 All check workers completed")
 	}()
 
-	// Collect results
+	// Collect results with progress tracking
+	log.Printf("📥 Collecting file check results...")
 	skippedCount := 0
-	for result := range resultChan {
+	errorCount := 0
+	checkStartTime := time.Now()
+
+	for i := 0; i < len(allFiles); i++ {
+		result := <-resultChan
+
+		if result.error != nil {
+			errorCount++
+			log.Printf("❌ Error checking file %s: %v", filepath.Base(result.file.path), result.error)
+			continue
+		}
+
 		if result.needsProcessing {
 			filesToProcess = append(filesToProcess, result.file)
 		} else {
 			skippedCount++
 		}
+
+		// Log progress every 1000 results
+		if (i+1)%1000 == 0 {
+			elapsed := time.Since(checkStartTime)
+			rate := float64(i+1) / elapsed.Seconds()
+			remaining := len(allFiles) - (i + 1)
+			eta := time.Duration(float64(remaining)/rate) * time.Second
+
+			log.Printf("📥 Processed %d/%d file checks (%.1f%%) - Rate: %.0f files/sec, ETA: %v",
+				i+1, len(allFiles), float64(i+1)/float64(len(allFiles))*100, rate, eta.Round(time.Second))
+		}
 	}
+
+	checkDuration := time.Since(checkStartTime)
+	log.Printf("✅ File checking completed in %v", checkDuration)
 
 	log.Printf("Total files found: %d", len(allFiles))
 	log.Printf("Files to process: %d", len(filesToProcess))
