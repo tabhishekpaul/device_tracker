@@ -597,8 +597,8 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 		fileName, fileHash[:8], isProcessed, result.HashCalcTime)
 
 	if isProcessed {
-		log.Printf("⏭️  Worker skipping already processed file: %s (total time: %v)",
-			fileName, time.Since(timing.StartTime))
+		//log.Printf("⏭️  Worker skipping already processed file: %s (total time: %v)",
+		//	fileName, time.Since(timing.StartTime))
 		loader.stats.AddSkippedFile(filePath)
 		result.Success = true
 		result.ProcessingTime = time.Since(timing.StartTime)
