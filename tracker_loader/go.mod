@@ -5,6 +5,7 @@ go 1.24.3
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.40.1
 	github.com/apache/arrow/go/v14 v14.0.2
+	github.com/mattn/go-sqlite3 v1.14.32
 )
 
 require (

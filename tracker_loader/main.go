@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,20 +19,20 @@ import (
 	"github.com/apache/arrow/go/v14/arrow/array"
 	"github.com/apache/arrow/go/v14/parquet/file"
 	"github.com/apache/arrow/go/v14/parquet/pqarrow"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type LoaderConfig struct {
-	CHHost         string
-	CHPort         int
-	CHDatabase     string
-	CHUser         string
-	CHPassword     string
-	MaxWorkers     int
-	ChunkSize      int
-	ResumeFromFile int
-	ProgressFile   string
-	RetryAttempts  int
-	QueryTimeout   time.Duration
+	CHHost        string
+	CHPort        int
+	CHDatabase    string
+	CHUser        string
+	CHPassword    string
+	MaxWorkers    int
+	ChunkSize     int
+	LocalDBPath   string
+	RetryAttempts int
+	QueryTimeout  time.Duration
 }
 
 type LoaderStats struct {
@@ -40,7 +42,6 @@ type LoaderStats struct {
 	SkippedFiles        []string
 	StartTime           time.Time
 	EndTime             time.Time
-	ProcessedFiles      map[string]bool
 	mu                  sync.RWMutex
 }
 
@@ -68,22 +69,18 @@ func (s *LoaderStats) AddSkippedFile(filePath string) {
 	s.SkippedFiles = append(s.SkippedFiles, filePath)
 }
 
-func (s *LoaderStats) MarkProcessed(filePath string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ProcessedFiles[filePath] = true
-}
-
-func (s *LoaderStats) IsProcessed(filePath string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.ProcessedFiles[filePath]
-}
-
 func (s *LoaderStats) GetStats() (int64, int64, []string, []string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.TotalFilesProcessed, s.TotalRowsInserted, s.FailedFiles, s.SkippedFiles
+}
+
+type ProcessedFile struct {
+	FilePath    string
+	FileHash    string
+	ProcessedAt time.Time
+	RecordCount int64
+	LoadDate    string
 }
 
 type FileProcessResult struct {
@@ -98,18 +95,128 @@ type FileProcessResult struct {
 }
 
 type ParquetToClickHouseLoader struct {
-	config LoaderConfig
-	stats  *LoaderStats
+	config  LoaderConfig
+	stats   *LoaderStats
+	localDB *sql.DB
 }
 
-func NewParquetToClickHouseLoader(config LoaderConfig) *ParquetToClickHouseLoader {
-	return &ParquetToClickHouseLoader{
-		config: config,
+func NewParquetToClickHouseLoader(config LoaderConfig) (*ParquetToClickHouseLoader, error) {
+	// Initialize local SQLite database
+	localDB, err := sql.Open("sqlite3", config.LocalDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open local database: %w", err)
+	}
+
+	loader := &ParquetToClickHouseLoader{
+		config:  config,
+		localDB: localDB,
 		stats: &LoaderStats{
-			StartTime:      time.Now(),
-			ProcessedFiles: make(map[string]bool),
+			StartTime: time.Now(),
 		},
 	}
+
+	if err := loader.initLocalDB(); err != nil {
+		return nil, fmt.Errorf("failed to initialize local database: %w", err)
+	}
+
+	return loader, nil
+}
+
+func (loader *ParquetToClickHouseLoader) initLocalDB() error {
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS processed_files (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		file_path TEXT NOT NULL UNIQUE,
+		file_hash TEXT NOT NULL,
+		processed_at DATETIME NOT NULL,
+		record_count INTEGER NOT NULL,
+		load_date TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	
+	CREATE INDEX IF NOT EXISTS idx_file_path ON processed_files(file_path);
+	CREATE INDEX IF NOT EXISTS idx_file_hash ON processed_files(file_hash);
+	CREATE INDEX IF NOT EXISTS idx_load_date ON processed_files(load_date);
+	`
+
+	if _, err := loader.localDB.Exec(createTableSQL); err != nil {
+		return fmt.Errorf("failed to create tables: %w", err)
+	}
+
+	log.Printf("Local tracking database initialized at: %s", loader.config.LocalDBPath)
+	return nil
+}
+
+func (loader *ParquetToClickHouseLoader) calculateFileHash(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func (loader *ParquetToClickHouseLoader) isFileProcessed(filePath string) (bool, string, error) {
+	// Calculate current file hash
+	currentHash, err := loader.calculateFileHash(filePath)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to calculate file hash: %w", err)
+	}
+
+	// Check if file with same path and hash exists
+	var existingHash string
+	var processedAt string
+	query := "SELECT file_hash, processed_at FROM processed_files WHERE file_path = ?"
+
+	err = loader.localDB.QueryRow(query, filePath).Scan(&existingHash, &processedAt)
+	if err == sql.ErrNoRows {
+		return false, currentHash, nil // File not processed
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("failed to check processed files: %w", err)
+	}
+
+	// If hashes match, file was already processed
+	if existingHash == currentHash {
+		log.Printf("File %s already processed at %s (hash: %s)",
+			filepath.Base(filePath), processedAt, currentHash[:8])
+		return true, currentHash, nil
+	}
+
+	// File exists but hash is different (file was modified)
+	log.Printf("File %s was modified since last processing, will reprocess", filepath.Base(filePath))
+	return false, currentHash, nil
+}
+
+func (loader *ParquetToClickHouseLoader) markFileAsProcessed(filePath, fileHash string, recordCount int64, loadDate string) error {
+	// Use REPLACE to handle both insert and update cases
+	query := `
+	REPLACE INTO processed_files (file_path, file_hash, processed_at, record_count, load_date)
+	VALUES (?, ?, ?, ?, ?)
+	`
+
+	_, err := loader.localDB.Exec(query, filePath, fileHash, time.Now(), recordCount, loadDate)
+	if err != nil {
+		return fmt.Errorf("failed to mark file as processed: %w", err)
+	}
+
+	return nil
+}
+
+func (loader *ParquetToClickHouseLoader) getProcessedFilesStats() (int, int64, error) {
+	var totalFiles int
+	var totalRecords int64
+
+	query := "SELECT COUNT(*), COALESCE(SUM(record_count), 0) FROM processed_files"
+	err := loader.localDB.QueryRow(query).Scan(&totalFiles, &totalRecords)
+
+	return totalFiles, totalRecords, err
 }
 
 func (loader *ParquetToClickHouseLoader) getClickHouseURL() string {
@@ -117,47 +224,6 @@ func (loader *ParquetToClickHouseLoader) getClickHouseURL() string {
 	return fmt.Sprintf("tcp://%s:%d?username=%s&password=%s&database=%s",
 		loader.config.CHHost, loader.config.CHPort,
 		loader.config.CHUser, loader.config.CHPassword, loader.config.CHDatabase)
-}
-
-func (loader *ParquetToClickHouseLoader) loadProgress() error {
-	if loader.config.ProgressFile == "" {
-		return nil
-	}
-
-	if _, err := os.Stat(loader.config.ProgressFile); os.IsNotExist(err) {
-		return nil
-	}
-
-	content, err := os.ReadFile(loader.config.ProgressFile)
-	if err != nil {
-		return fmt.Errorf("failed to read progress file: %w", err)
-	}
-
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			loader.stats.ProcessedFiles[line] = true
-		}
-	}
-
-	log.Printf("Loaded progress: %d files already processed", len(loader.stats.ProcessedFiles))
-	return nil
-}
-
-func (loader *ParquetToClickHouseLoader) saveProgress(filePath string) error {
-	if loader.config.ProgressFile == "" {
-		return nil
-	}
-
-	file, err := os.OpenFile(loader.config.ProgressFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open progress file: %w", err)
-	}
-	defer file.Close()
-
-	_, err = file.WriteString(filePath + "\n")
-	return err
 }
 
 func (loader *ParquetToClickHouseLoader) setupDatabase() error {
@@ -295,7 +361,13 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 	log.Printf("Processing file: %s", filepath.Base(filePath))
 
 	// Check if file was already processed
-	if loader.stats.IsProcessed(filePath) {
+	isProcessed, fileHash, err := loader.isFileProcessed(filePath)
+	if err != nil {
+		result.Error = fmt.Errorf("failed to check if file was processed: %w", err)
+		return result
+	}
+
+	if isProcessed {
 		log.Printf("Skipping already processed file: %s", filepath.Base(filePath))
 		loader.stats.AddSkippedFile(filePath)
 		result.Success = true
@@ -360,9 +432,13 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 	numRows := int(table.NumRows())
 	if numRows == 0 {
 		log.Printf("Warning: Empty file: %s", filePath)
+
+		// Mark empty file as processed
+		if err := loader.markFileAsProcessed(filePath, fileHash, 0, loadDate.Format("20060102")); err != nil {
+			log.Printf("Warning: failed to mark empty file as processed: %v", err)
+		}
+
 		result.Success = true
-		loader.stats.MarkProcessed(filePath)
-		loader.saveProgress(filePath)
 		return result
 	}
 
@@ -386,12 +462,14 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 		}
 	}
 
+	// Mark file as processed
+	if err := loader.markFileAsProcessed(filePath, fileHash, rowsInserted, loadDate.Format("20060102")); err != nil {
+		log.Printf("Warning: failed to mark file as processed: %v", err)
+	}
+
 	result.RowsProcessed = rowsInserted
 	result.Success = true
 	result.ProcessingTime = time.Since(result.StartTime)
-
-	loader.stats.MarkProcessed(filePath)
-	loader.saveProgress(filePath)
 
 	log.Printf("Successfully processed %s: %d rows in %v",
 		filepath.Base(filePath), rowsInserted, result.ProcessingTime)
@@ -552,14 +630,14 @@ func (loader *ParquetToClickHouseLoader) getFloat64Value(col *arrow.Column, row 
 }
 
 func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders []string) error {
-	if err := loader.loadProgress(); err != nil {
-		log.Printf("Warning: Could not load progress: %v", err)
-	}
-
 	go loader.monitorResources()
 
 	loader.stats.StartTime = time.Now()
 	log.Printf("Starting parallel data loading with %d workers...", loader.config.MaxWorkers)
+
+	// Get initial stats from tracking database
+	processedFiles, processedRecords, _ := loader.getProcessedFilesStats()
+	log.Printf("Previously processed: %d files, %s records", processedFiles, formatNumber(processedRecords))
 
 	allFiles, err := loader.getParquetFiles(parquetFolders)
 	if err != nil {
@@ -571,24 +649,30 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 		return nil
 	}
 
+	// Filter files that need processing
 	var filesToProcess []struct {
 		path     string
 		loadDate time.Time
 	}
 
-	startIndex := 0
-	if loader.config.ResumeFromFile > 0 {
-		startIndex = loader.config.ResumeFromFile - 1
-		log.Printf("Resuming from file index: %d", startIndex)
-	}
+	skippedCount := 0
+	for _, file := range allFiles {
+		isProcessed, _, err := loader.isFileProcessed(file.path)
+		if err != nil {
+			log.Printf("Error checking file %s: %v", filepath.Base(file.path), err)
+			continue
+		}
 
-	for i := startIndex; i < len(allFiles); i++ {
-		if !loader.stats.IsProcessed(allFiles[i].path) {
-			filesToProcess = append(filesToProcess, allFiles[i])
+		if !isProcessed {
+			filesToProcess = append(filesToProcess, file)
+		} else {
+			skippedCount++
 		}
 	}
 
-	log.Printf("Files to process: %d (skipping %d already processed)", len(filesToProcess), len(allFiles)-len(filesToProcess))
+	log.Printf("Total files found: %d", len(allFiles))
+	log.Printf("Files to process: %d", len(filesToProcess))
+	log.Printf("Files already processed: %d", skippedCount)
 
 	if len(filesToProcess) == 0 {
 		log.Println("All files have already been processed!")
@@ -663,12 +747,17 @@ func (loader *ParquetToClickHouseLoader) printFinalStats() {
 	log.Printf("Files processed successfully: %d", processed)
 	log.Printf("Files skipped (already processed): %d", len(skippedFiles))
 	log.Printf("Files failed: %d", len(failedFiles))
-	log.Printf("Total rows inserted: %s", formatNumber(totalRows))
+	log.Printf("New rows inserted this run: %s", formatNumber(totalRows))
 
 	if totalRows > 0 && duration.Seconds() > 0 {
 		rowsPerSecond := float64(totalRows) / duration.Seconds()
 		log.Printf("Average insertion rate: %s rows/second", formatNumber(int64(rowsPerSecond)))
 	}
+
+	// Get total stats from tracking database
+	totalFiles, totalRecords, _ := loader.getProcessedFilesStats()
+	log.Printf("Total files in tracking DB: %d", totalFiles)
+	log.Printf("Total records in tracking DB: %s", formatNumber(totalRecords))
 
 	if len(failedFiles) > 0 {
 		log.Println("\nFailed files:")
@@ -754,6 +843,12 @@ func (loader *ParquetToClickHouseLoader) monitorResources() {
 	}
 }
 
+func (loader *ParquetToClickHouseLoader) Close() {
+	if loader.localDB != nil {
+		loader.localDB.Close()
+	}
+}
+
 func formatNumber(n int64) string {
 	str := fmt.Sprintf("%d", n)
 	result := ""
@@ -768,17 +863,16 @@ func formatNumber(n int64) string {
 
 func main() {
 	config := LoaderConfig{
-		CHHost:         "localhost",
-		CHPort:         9000, // Use 8123 for HTTP interface
-		CHDatabase:     "device_tracking",
-		CHUser:         "default",
-		CHPassword:     "nyros",
-		MaxWorkers:     runtime.NumCPU() / 2,
-		ChunkSize:      100000,
-		ResumeFromFile: 2366,
-		ProgressFile:   "/tmp/parquet_loader_progress.txt",
-		RetryAttempts:  3,
-		QueryTimeout:   5 * time.Minute,
+		CHHost:        "localhost",
+		CHPort:        9000, // Use 8123 for HTTP interface
+		CHDatabase:    "device_tracking",
+		CHUser:        "default",
+		CHPassword:    "nyros",
+		MaxWorkers:    runtime.NumCPU() / 2,
+		ChunkSize:     100000,
+		LocalDBPath:   "./parquet_tracking.db", // SQLite database for tracking
+		RetryAttempts: 3,
+		QueryTimeout:  5 * time.Minute,
 	}
 
 	parquetFolders := []string{
@@ -787,7 +881,11 @@ func main() {
 		//"/mnt/blobcontainer/load_date=20250821",
 	}
 
-	loader := NewParquetToClickHouseLoader(config)
+	loader, err := NewParquetToClickHouseLoader(config)
+	if err != nil {
+		log.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
 
 	if err := loader.setupDatabase(); err != nil {
 		log.Fatalf("Database setup failed: %v", err)
