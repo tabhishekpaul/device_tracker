@@ -8,7 +8,6 @@ import (
 )
 
 func main() {
-	// Configuration
 	config := Config{
 		ClickHouse: ClickHouseConfig{
 			Host:     "172.173.97.164",
@@ -19,13 +18,20 @@ func main() {
 		},
 		Processing: ProcessingConfig{
 			FilterInTime:      "02:00:00",
-			FilterOutTime:     "04:30:00",
+			FilterOutTime:     "06:00:00",
 			MovementThreshold: 0.0001,
-			SearchRadius:      20.0,
-			MinPings:          3,
-			MaxWorkers:        10,
+			SearchRadius:      100.0,
+			MinIdlePings:      3,
+			MaxWorkers:        4,
+			BatchSize:         10000,
 		},
 	}
+
+	tracker, err := NewDeviceTracker(config)
+	if err != nil {
+		log.Fatalf("Failed to create device tracker: %v", err)
+	}
+	defer tracker.Close()
 
 	startDateStr := "2025-08-23"
 	startDate, err := time.Parse("2006-01-02", startDateStr)
@@ -45,18 +51,10 @@ func main() {
 
 	fmt.Println(targetDates)
 
-	// Create device tracker
-	tracker, err := NewDeviceTracker(config)
-	if err != nil {
-		log.Fatalf("Failed to create device tracker: %v", err)
-	}
-	defer tracker.Close()
-
-	// Run the complete analysis
 	ctx := context.Background()
-	if err := tracker.RunCompleteAnalysis(ctx, targetDates); err != nil {
-		log.Fatalf("Analysis failed: %v", err)
+	if err := tracker.RunCampaignConsumerAnalysis(ctx, targetDates); err != nil {
+		log.Fatalf("Failed to run campaign consumer analysis: %v", err)
 	}
 
-	log.Println("Analysis completed successfully!")
+	log.Println("Campaign consumer analysis completed successfully!")
 }
