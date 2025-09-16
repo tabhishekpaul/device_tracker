@@ -103,7 +103,7 @@ func connectClickHouse(config Config) (*sql.DB, error) {
 
 func createTable(db *sql.DB) error {
 	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS campaigns (
+	CREATE TABLE IF NOT EXISTS device_tracking.campaigns (
 		campaign_id String,
 		address String,
 		geometry String,
@@ -224,7 +224,7 @@ func findColumnIndices(headers []string) (addressIndex, geometryIndex int) {
 
 func insertCampaignData(db *sql.DB, data []CampaignData) error {
 	// Prepare batch insert statement
-	insertSQL := `INSERT INTO campaigns (campaign_id, address, geometry) VALUES (?, ?, ?)`
+	insertSQL := `INSERT INTO device_tracking.campaigns (campaign_id, address, geometry) VALUES (?, ?, ?)`
 
 	// Begin transaction for better performance
 	tx, err := db.Begin()
@@ -267,7 +267,7 @@ func insertCampaignDataBatch(db *sql.DB, data []CampaignData) error {
 		valueArgs = append(valueArgs, record.CampaignID, record.Address, record.Geometry)
 	}
 
-	query := fmt.Sprintf("INSERT INTO campaigns (campaign_id, address, geometry) VALUES %s",
+	query := fmt.Sprintf("INSERT INTO device_tracking.campaigns (campaign_id, address, geometry) VALUES %s",
 		strings.Join(valueStrings, ","))
 
 	_, err := db.Exec(query, valueArgs...)
