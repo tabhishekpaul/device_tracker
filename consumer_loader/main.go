@@ -199,7 +199,7 @@ func (cpl *ConsumerParquetLoader) LoadConsumersFromParquet(ctx context.Context, 
 	totalRecords := 0
 	skippedFiles := 0
 	processedFilesCount := 0
-	batchSize := 1000
+	batchSize := 100000
 
 	for idx, filePath := range files {
 		cpl.logger.Printf("Checking file %d/%d: %s", idx+1, len(files), filepath.Base(filePath))
