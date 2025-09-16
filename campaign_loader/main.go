@@ -37,7 +37,7 @@ func main() {
 	}
 
 	// Replace with your root directory path containing subdirectories with CSV files
-	rootDir := "./campaign_data"
+	rootDir := "/mnt/blobcontainer/Geocoded"
 
 	if err := processDirectory(rootDir, config); err != nil {
 		log.Fatalf("Error processing directory: %v", err)
