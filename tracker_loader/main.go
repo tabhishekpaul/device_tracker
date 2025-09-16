@@ -925,7 +925,7 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 	}
 
 	// Filter files that need processing in parallel
-	var filesToProcess []struct {
+	/*var filesToProcess []struct {
 		path     string
 		loadDate time.Time
 	}
@@ -987,7 +987,9 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 
 	log.Printf("Total files found: %d", len(allFiles))
 	log.Printf("Files to process: %d", len(filesToProcess))
-	log.Printf("Files already processed: %d", skippedCount)
+	log.Printf("Files already processed: %d", skippedCount)*/
+
+	filesToProcess := allFiles
 
 	if len(filesToProcess) == 0 {
 		log.Println("All files have already been processed!")
@@ -997,7 +999,7 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 	filesChan := make(chan struct {
 		path     string
 		loadDate time.Time
-	}, len(filesToProcess))
+	}, len(allFiles))
 	resultsChan := make(chan FileProcessResult, len(filesToProcess))
 
 	var wg sync.WaitGroup
