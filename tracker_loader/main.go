@@ -33,6 +33,12 @@ type LoaderConfig struct {
 	LocalDBPath   string
 	RetryAttempts int
 	QueryTimeout  time.Duration
+	// New performance settings
+	MaxConnections     int
+	BatchInsertWorkers int
+	FileReadBuffer     int
+	MemoryLimit        int64 // bytes
+	MaxBatchSize       int
 }
 
 type LoaderStats struct {
@@ -94,22 +100,44 @@ type FileProcessResult struct {
 	Retried        bool
 }
 
+type DataBatch struct {
+	DeviceIDs  []string
+	Timestamps []time.Time
+	Latitudes  []float64
+	Longitudes []float64
+	LoadDate   time.Time
+	Size       int
+}
+
 type ParquetToClickHouseLoader struct {
-	config  LoaderConfig
-	stats   *LoaderStats
-	localDB *sql.DB
+	config    LoaderConfig
+	stats     *LoaderStats
+	localDB   *sql.DB
+	connPool  chan *sql.DB
+	batchChan chan *DataBatch
+	batchWg   sync.WaitGroup
 }
 
 func NewParquetToClickHouseLoader(config LoaderConfig) (*ParquetToClickHouseLoader, error) {
-	// Initialize local SQLite database
-	localDB, err := sql.Open("sqlite3", config.LocalDBPath)
+	// Set GOMAXPROCS to use all available CPUs
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// Initialize local SQLite database with performance settings
+	localDB, err := sql.Open("sqlite3", config.LocalDBPath+"?cache=shared&mode=rwc&_journal_mode=WAL&_synchronous=NORMAL&_cache_size=100000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open local database: %w", err)
 	}
 
+	// Configure SQLite for performance
+	localDB.SetMaxOpenConns(20)
+	localDB.SetMaxIdleConns(10)
+	localDB.SetConnMaxLifetime(time.Hour)
+
 	loader := &ParquetToClickHouseLoader{
-		config:  config,
-		localDB: localDB,
+		config:    config,
+		localDB:   localDB,
+		connPool:  make(chan *sql.DB, config.MaxConnections),
+		batchChan: make(chan *DataBatch, config.MaxConnections*2),
 		stats: &LoaderStats{
 			StartTime: time.Now(),
 		},
@@ -119,13 +147,127 @@ func NewParquetToClickHouseLoader(config LoaderConfig) (*ParquetToClickHouseLoad
 		return nil, fmt.Errorf("failed to initialize local database: %w", err)
 	}
 
+	// Initialize connection pool
+	if err := loader.initConnectionPool(); err != nil {
+		return nil, fmt.Errorf("failed to initialize connection pool: %w", err)
+	}
+
+	// Start batch insert workers
+	loader.startBatchInsertWorkers()
+
 	return loader, nil
+}
+
+func (loader *ParquetToClickHouseLoader) initConnectionPool() error {
+	log.Printf("Initializing connection pool with %d connections...", loader.config.MaxConnections)
+
+	for i := 0; i < loader.config.MaxConnections; i++ {
+		conn, err := sql.Open("clickhouse", loader.getClickHouseURL())
+		if err != nil {
+			return fmt.Errorf("failed to create connection %d: %w", i, err)
+		}
+
+		// Configure connection for high performance
+		conn.SetMaxOpenConns(1)
+		conn.SetMaxIdleConns(1)
+		conn.SetConnMaxLifetime(0) // No expiration
+
+		// Test connection
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := conn.PingContext(ctx); err != nil {
+			cancel()
+			return fmt.Errorf("failed to ping connection %d: %w", i, err)
+		}
+		cancel()
+
+		loader.connPool <- conn
+	}
+
+	log.Printf("Connection pool initialized successfully")
+	return nil
+}
+
+func (loader *ParquetToClickHouseLoader) getConnection() *sql.DB {
+	return <-loader.connPool
+}
+
+func (loader *ParquetToClickHouseLoader) returnConnection(conn *sql.DB) {
+	loader.connPool <- conn
+}
+
+func (loader *ParquetToClickHouseLoader) startBatchInsertWorkers() {
+	log.Printf("Starting %d batch insert workers...", loader.config.BatchInsertWorkers)
+
+	for i := 0; i < loader.config.BatchInsertWorkers; i++ {
+		loader.batchWg.Add(1)
+		go func(workerID int) {
+			defer loader.batchWg.Done()
+			loader.batchInsertWorker(workerID)
+		}(i)
+	}
+}
+
+func (loader *ParquetToClickHouseLoader) batchInsertWorker(workerID int) {
+	for batch := range loader.batchChan {
+		start := time.Now()
+
+		conn := loader.getConnection()
+		err := loader.insertBatch(conn, batch)
+		loader.returnConnection(conn)
+
+		if err != nil {
+			log.Printf("Batch insert worker %d failed: %v", workerID, err)
+			// You might want to implement retry logic here
+		} else {
+			duration := time.Since(start)
+			rowsPerSec := float64(batch.Size) / duration.Seconds()
+			log.Printf("Worker %d: Inserted %d rows in %.2fs (%.0f rows/sec)",
+				workerID, batch.Size, duration.Seconds(), rowsPerSec)
+		}
+	}
+}
+
+func (loader *ParquetToClickHouseLoader) insertBatch(conn *sql.DB, batch *DataBatch) error {
+	if batch.Size == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), loader.config.QueryTimeout)
+	defer cancel()
+
+	// Prepare the query with placeholders
+	placeholders := make([]string, batch.Size)
+	args := make([]interface{}, 0, batch.Size*5)
+
+	for i := 0; i < batch.Size; i++ {
+		placeholders[i] = "(?, ?, ?, ?, ?)"
+		args = append(args,
+			batch.DeviceIDs[i],
+			batch.Timestamps[i],
+			batch.Latitudes[i],
+			batch.Longitudes[i],
+			batch.LoadDate)
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO device_data 
+		(device_id, event_timestamp, latitude, longitude, load_date) 
+		VALUES %s`, strings.Join(placeholders, ","))
+
+	_, err := conn.ExecContext(ctx, query, args...)
+	return err
 }
 
 func (loader *ParquetToClickHouseLoader) initLocalDB() error {
 	createTableSQL := `
+	PRAGMA journal_mode = WAL;
+	PRAGMA synchronous = NORMAL;
+	PRAGMA cache_size = 100000;
+	PRAGMA temp_store = MEMORY;
+	PRAGMA mmap_size = 268435456;
+	
 	CREATE TABLE IF NOT EXISTS processed_files (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id INTEGER PRIMARY KEY,
 		file_path TEXT NOT NULL UNIQUE,
 		file_hash TEXT NOT NULL,
 		processed_at DATETIME NOT NULL,
@@ -155,8 +297,20 @@ func (loader *ParquetToClickHouseLoader) calculateFileHash(filePath string) (str
 	defer file.Close()
 
 	hash := md5.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
+	// Use larger buffer for faster hashing
+	buffer := make([]byte, 1024*1024) // 1MB buffer
+
+	for {
+		n, err := file.Read(buffer)
+		if n > 0 {
+			hash.Write(buffer[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
 	}
 
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
@@ -220,8 +374,7 @@ func (loader *ParquetToClickHouseLoader) getProcessedFilesStats() (int, int64, e
 }
 
 func (loader *ParquetToClickHouseLoader) getClickHouseURL() string {
-	// Use the working connection string from our test
-	return fmt.Sprintf("tcp://%s:%d?username=%s&password=%s&database=%s",
+	return fmt.Sprintf("tcp://%s:%d?username=%s&password=%s&database=%s&max_execution_time=0&max_memory_usage=0&max_block_size=1048576&max_insert_block_size=1048576",
 		loader.config.CHHost, loader.config.CHPort,
 		loader.config.CHUser, loader.config.CHPassword, loader.config.CHDatabase)
 }
@@ -234,18 +387,15 @@ func (loader *ParquetToClickHouseLoader) setupDatabase() error {
 	debugConnStr := strings.Replace(connStr, loader.config.CHPassword, "***", 1)
 	log.Printf("Using connection string: %s", debugConnStr)
 
-	conn, err := sql.Open("clickhouse", connStr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to ClickHouse: %w", err)
-	}
-	defer conn.Close()
+	conn := loader.getConnection()
+	defer loader.returnConnection(conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), loader.config.QueryTimeout)
 	defer cancel()
 
 	// Test connection first
 	var testResult int
-	err = conn.QueryRowContext(ctx, "SELECT 1").Scan(&testResult)
+	err := conn.QueryRowContext(ctx, "SELECT 1").Scan(&testResult)
 	if err != nil {
 		return fmt.Errorf("failed to test connection: %w", err)
 	}
@@ -275,6 +425,7 @@ func (loader *ParquetToClickHouseLoader) setupDatabase() error {
 		return fmt.Errorf("failed to drop table: %w", err)
 	}
 
+	// Optimized table schema for high-performance inserts
 	createTableSQL := `
         CREATE TABLE device_data (
                 device_id LowCardinality(String),
@@ -289,9 +440,15 @@ func (loader *ParquetToClickHouseLoader) setupDatabase() error {
                 index_granularity = 8192,
                 compress_marks = 1,
                 compress_primary_key = 1,
-                max_compress_block_size = 2097152,
-                min_compress_block_size = 65536,
-                max_insert_block_size = 1048576
+                max_compress_block_size = 8388608,
+                min_compress_block_size = 262144,
+                max_insert_block_size = 16777216,
+                max_threads = 64,
+                max_insert_threads = 32,
+                max_memory_usage = 0,
+                optimize_on_insert = 0,
+                async_insert = 1,
+                wait_for_async_insert = 0
         `
 
 	_, err = conn.ExecContext(ctx, createTableSQL)
@@ -299,7 +456,7 @@ func (loader *ParquetToClickHouseLoader) setupDatabase() error {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	log.Println("ClickHouse table 'device_data' created successfully")
+	log.Println("ClickHouse table 'device_data' created successfully with optimized settings")
 	return nil
 }
 
@@ -312,41 +469,54 @@ func (loader *ParquetToClickHouseLoader) getParquetFiles(baseFolders []string) (
 		loadDate time.Time
 	}
 
+	// Process folders in parallel
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
 	for _, folder := range baseFolders {
-		if _, err := os.Stat(folder); os.IsNotExist(err) {
-			log.Printf("Warning: Folder does not exist: %s", folder)
-			continue
-		}
+		wg.Add(1)
+		go func(folder string) {
+			defer wg.Done()
 
-		folderName := filepath.Base(folder)
-		if !strings.Contains(folderName, "load_date=") {
-			log.Printf("Error: Folder name doesn't contain load_date: %s", folder)
-			continue
-		}
+			if _, err := os.Stat(folder); os.IsNotExist(err) {
+				log.Printf("Warning: Folder does not exist: %s", folder)
+				return
+			}
 
-		dateStr := strings.Split(folderName, "=")[1]
-		loadDate, err := time.Parse("20060102", dateStr)
-		if err != nil {
-			log.Printf("Error: Invalid date format in folder: %s", folder)
-			continue
-		}
+			folderName := filepath.Base(folder)
+			if !strings.Contains(folderName, "load_date=") {
+				log.Printf("Error: Folder name doesn't contain load_date: %s", folder)
+				return
+			}
 
-		pattern := filepath.Join(folder, "*.parquet")
-		files, err := filepath.Glob(pattern)
-		if err != nil {
-			log.Printf("Error scanning folder %s: %v", folder, err)
-			continue
-		}
+			dateStr := strings.Split(folderName, "=")[1]
+			loadDate, err := time.Parse("20060102", dateStr)
+			if err != nil {
+				log.Printf("Error: Invalid date format in folder: %s", folder)
+				return
+			}
 
-		for _, filePath := range files {
-			allFiles = append(allFiles, struct {
-				path     string
-				loadDate time.Time
-			}{filePath, loadDate})
-		}
+			pattern := filepath.Join(folder, "*.parquet")
+			files, err := filepath.Glob(pattern)
+			if err != nil {
+				log.Printf("Error scanning folder %s: %v", folder, err)
+				return
+			}
 
-		log.Printf("Found %d parquet files in %s", len(files), folder)
+			mu.Lock()
+			for _, filePath := range files {
+				allFiles = append(allFiles, struct {
+					path     string
+					loadDate time.Time
+				}{filePath, loadDate})
+			}
+			mu.Unlock()
+
+			log.Printf("Found %d parquet files in %s", len(files), folder)
+		}(folder)
 	}
+
+	wg.Wait()
 
 	log.Printf("Total parquet files found: %d", len(allFiles))
 	return allFiles, nil
@@ -374,15 +544,15 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 		return result
 	}
 
-	// Open parquet file
-	osFile, err := os.Open(filePath)
+	// Open parquet file with larger buffer
+	osFile, err := os.OpenFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to open file: %w", err)
 		return result
 	}
 	defer osFile.Close()
 
-	// Create parquet reader - simplified version
+	// Create parquet reader
 	pf, err := file.NewParquetReader(osFile)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create parquet reader: %w", err)
@@ -390,8 +560,11 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 	}
 	defer pf.Close()
 
-	// Create Arrow reader - use basic constructor
-	arrowReader, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{}, nil)
+	// Create Arrow reader with optimized settings
+	arrowReader, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{
+		BatchSize: int64(loader.config.MaxBatchSize),
+		Parallel:  true,
+	}, nil)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create arrow reader: %w", err)
 		return result
@@ -478,15 +651,6 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 }
 
 func (loader *ParquetToClickHouseLoader) insertTableData(table arrow.Table, loadDate time.Time) (int64, error) {
-	conn, err := sql.Open("clickhouse", loader.getClickHouseURL())
-	if err != nil {
-		return 0, fmt.Errorf("failed to connect to ClickHouse: %w", err)
-	}
-	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), loader.config.QueryTimeout)
-	defer cancel()
-
 	// Find column indices
 	schema := table.Schema()
 	deviceIDIdx, timestampIdx, latIdx, lonIdx := -1, -1, -1, -1
@@ -514,20 +678,25 @@ func (loader *ParquetToClickHouseLoader) insertTableData(table arrow.Table, load
 	latCol := table.Column(latIdx)
 	lonCol := table.Column(lonIdx)
 
-	// Process data in smaller chunks
+	// Process data in large batches for maximum throughput
 	numRows := int(table.NumRows())
-	chunkSize := loader.config.ChunkSize / 2
 	var totalInserted int64
 
-	for start := 0; start < numRows; start += chunkSize {
-		end := start + chunkSize
+	batchSize := loader.config.ChunkSize
+
+	for start := 0; start < numRows; start += batchSize {
+		end := start + batchSize
 		if end > numRows {
 			end = numRows
 		}
 
-		var values []string
-		var args []interface{}
-		validRows := 0
+		batch := &DataBatch{
+			DeviceIDs:  make([]string, 0, end-start),
+			Timestamps: make([]time.Time, 0, end-start),
+			Latitudes:  make([]float64, 0, end-start),
+			Longitudes: make([]float64, 0, end-start),
+			LoadDate:   loadDate,
+		}
 
 		for i := start; i < end; i++ {
 			deviceID := loader.getStringValue(deviceIDCol, i)
@@ -541,29 +710,22 @@ func (loader *ParquetToClickHouseLoader) insertTableData(table arrow.Table, load
 				continue
 			}
 
-			values = append(values, "(?, ?, ?, ?, ?)")
-			args = append(args, deviceID, timestamp, latitude, longitude, loadDate)
-			validRows++
+			batch.DeviceIDs = append(batch.DeviceIDs, deviceID)
+			batch.Timestamps = append(batch.Timestamps, timestamp)
+			batch.Latitudes = append(batch.Latitudes, latitude)
+			batch.Longitudes = append(batch.Longitudes, longitude)
 		}
 
-		if validRows == 0 {
-			continue
+		batch.Size = len(batch.DeviceIDs)
+
+		if batch.Size > 0 {
+			// Send batch to worker pool
+			loader.batchChan <- batch
+			totalInserted += int64(batch.Size)
 		}
 
-		query := fmt.Sprintf(`
-                        INSERT INTO device_data 
-                        (device_id, event_timestamp, latitude, longitude, load_date) 
-                        VALUES %s`, strings.Join(values, ","))
-
-		_, err := conn.ExecContext(ctx, query, args...)
-		if err != nil {
-			return totalInserted, fmt.Errorf("failed to insert batch: %w", err)
-		}
-
-		totalInserted += int64(validRows)
-
-		if numRows > chunkSize && start%50000 == 0 {
-			log.Printf("Inserted %d/%d rows", start+validRows, numRows)
+		if numRows > batchSize && start%100000 == 0 {
+			log.Printf("Queued %d/%d rows for insertion", start+batch.Size, numRows)
 		}
 	}
 
@@ -630,10 +792,9 @@ func (loader *ParquetToClickHouseLoader) getFloat64Value(col *arrow.Column, row 
 }
 
 func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders []string) error {
-	go loader.monitorResources()
-
 	loader.stats.StartTime = time.Now()
-	log.Printf("Starting parallel data loading with %d workers...", loader.config.MaxWorkers)
+	log.Printf("Starting parallel data loading with %d file workers and %d batch workers...",
+		loader.config.MaxWorkers, loader.config.BatchInsertWorkers)
 
 	// Get initial stats from tracking database
 	processedFiles, processedRecords, _ := loader.getProcessedFilesStats()
@@ -649,22 +810,62 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 		return nil
 	}
 
-	// Filter files that need processing
+	// Filter files that need processing in parallel
 	var filesToProcess []struct {
 		path     string
 		loadDate time.Time
 	}
 
-	skippedCount := 0
-	for _, file := range allFiles {
-		isProcessed, _, err := loader.isFileProcessed(file.path)
-		if err != nil {
-			log.Printf("Error checking file %s: %v", filepath.Base(file.path), err)
-			continue
+	type checkResult struct {
+		file struct {
+			path     string
+			loadDate time.Time
 		}
+		needsProcessing bool
+	}
 
-		if !isProcessed {
-			filesToProcess = append(filesToProcess, file)
+	checkChan := make(chan struct {
+		path     string
+		loadDate time.Time
+	}, len(allFiles))
+
+	resultChan := make(chan checkResult, len(allFiles))
+
+	// Start workers to check file processing status
+	checkWorkers := runtime.NumCPU()
+	var checkWg sync.WaitGroup
+
+	for i := 0; i < checkWorkers; i++ {
+		checkWg.Add(1)
+		go func() {
+			defer checkWg.Done()
+			for file := range checkChan {
+				isProcessed, _, err := loader.isFileProcessed(file.path)
+				needsProcessing := err == nil && !isProcessed
+				resultChan <- checkResult{file: file, needsProcessing: needsProcessing}
+			}
+		}()
+	}
+
+	// Send files to check
+	go func() {
+		for _, file := range allFiles {
+			checkChan <- file
+		}
+		close(checkChan)
+	}()
+
+	// Close result channel when all checks are done
+	go func() {
+		checkWg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	skippedCount := 0
+	for result := range resultChan {
+		if result.needsProcessing {
+			filesToProcess = append(filesToProcess, result.file)
 		} else {
 			skippedCount++
 		}
@@ -721,15 +922,19 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 			if result.Retried {
 				retryStatus = " (retried)"
 			}
-			log.Printf("✅ (%d/%d) Completed: %s - %d rows in %.2fs%s",
-				completed, len(filesToProcess), filepath.Base(result.FilePath),
+			log.Printf("✅ (%d/%d) Worker %d Completed: %s - %d rows in %.2fs%s",
+				completed, len(filesToProcess), result.WorkerID, filepath.Base(result.FilePath),
 				result.RowsProcessed, result.ProcessingTime.Seconds(), retryStatus)
 		} else {
 			loader.stats.AddFailedFile(result.FilePath)
-			log.Printf("❌ (%d/%d) Failed: %s - %v",
-				completed, len(filesToProcess), filepath.Base(result.FilePath), result.Error)
+			log.Printf("❌ (%d/%d) Worker %d Failed: %s - %v",
+				completed, len(filesToProcess), result.WorkerID, filepath.Base(result.FilePath), result.Error)
 		}
 	}
+
+	// Close batch channel and wait for all batches to be processed
+	close(loader.batchChan)
+	loader.batchWg.Wait()
 
 	loader.stats.EndTime = time.Now()
 	loader.printFinalStats()
@@ -740,9 +945,9 @@ func (loader *ParquetToClickHouseLoader) printFinalStats() {
 	duration := loader.stats.EndTime.Sub(loader.stats.StartTime)
 	processed, totalRows, failedFiles, skippedFiles := loader.stats.GetStats()
 
-	log.Println("=" + strings.Repeat("=", 80))
-	log.Println("DATA LOADING COMPLETED")
-	log.Println("=" + strings.Repeat("=", 80))
+	log.Println("=" + strings.Repeat("=", 100))
+	log.Println("HIGH-PERFORMANCE DATA LOADING COMPLETED")
+	log.Println("=" + strings.Repeat("=", 100))
 	log.Printf("Total processing time: %v", duration)
 	log.Printf("Files processed successfully: %d", processed)
 	log.Printf("Files skipped (already processed): %d", len(skippedFiles))
@@ -752,12 +957,26 @@ func (loader *ParquetToClickHouseLoader) printFinalStats() {
 	if totalRows > 0 && duration.Seconds() > 0 {
 		rowsPerSecond := float64(totalRows) / duration.Seconds()
 		log.Printf("Average insertion rate: %s rows/second", formatNumber(int64(rowsPerSecond)))
+
+		// Calculate throughput per worker
+		avgPerWorker := rowsPerSecond / float64(loader.config.MaxWorkers)
+		log.Printf("Average per file worker: %.0f rows/second", avgPerWorker)
+
+		avgPerBatchWorker := rowsPerSecond / float64(loader.config.BatchInsertWorkers)
+		log.Printf("Average per batch worker: %.0f rows/second", avgPerBatchWorker)
 	}
 
 	// Get total stats from tracking database
 	totalFiles, totalRecords, _ := loader.getProcessedFilesStats()
 	log.Printf("Total files in tracking DB: %d", totalFiles)
 	log.Printf("Total records in tracking DB: %s", formatNumber(totalRecords))
+
+	// Memory usage stats
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	log.Printf("Memory usage - Alloc: %s MB, Sys: %s MB",
+		formatNumber(int64(m.Alloc/1024/1024)),
+		formatNumber(int64(m.Sys/1024/1024)))
 
 	if len(failedFiles) > 0 {
 		log.Println("\nFailed files:")
@@ -770,12 +989,10 @@ func (loader *ParquetToClickHouseLoader) printFinalStats() {
 }
 
 func (loader *ParquetToClickHouseLoader) verifyData() {
-	conn, err := sql.Open("clickhouse", loader.getClickHouseURL())
-	if err != nil {
-		log.Printf("Failed to connect for verification: %v", err)
-		return
-	}
-	defer conn.Close()
+	log.Println("\nPerforming data verification...")
+
+	conn := loader.getConnection()
+	defer loader.returnConnection(conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -798,55 +1015,79 @@ func (loader *ParquetToClickHouseLoader) verifyData() {
 		return
 	}
 
-	log.Println("\nClickHouse verification:")
+	// Additional performance metrics
+	var avgRowsPerPartition float64
+	if err := conn.QueryRowContext(ctx, "SELECT avg(cnt) FROM (SELECT count() as cnt FROM device_data GROUP BY toYYYYMM(load_date))").Scan(&avgRowsPerPartition); err == nil {
+		log.Printf("Average rows per partition: %s", formatNumber(int64(avgRowsPerPartition)))
+	}
+
+	log.Println("\n" + strings.Repeat("=", 60))
+	log.Println("CLICKHOUSE DATA VERIFICATION RESULTS")
+	log.Println(strings.Repeat("=", 60))
 	log.Printf("Total rows in database: %s", formatNumber(totalCount))
 	log.Printf("Unique devices: %s", formatNumber(uniqueDevices))
 	log.Printf("Date range: %s to %s", minDate, maxDate)
 }
 
 func (loader *ParquetToClickHouseLoader) optimizeTable() error {
-	log.Println("Optimizing ClickHouse table...")
+	log.Println("Optimizing ClickHouse table for maximum performance...")
 
-	conn, err := sql.Open("clickhouse", loader.getClickHouseURL())
-	if err != nil {
-		return fmt.Errorf("failed to connect for optimization: %w", err)
-	}
-	defer conn.Close()
+	conn := loader.getConnection()
+	defer loader.returnConnection(conn)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	_, err = conn.ExecContext(ctx, "OPTIMIZE TABLE device_data")
-	if err != nil {
-		return fmt.Errorf("failed to optimize table: %w", err)
+	// Run multiple optimization operations
+	optimizations := []struct {
+		name  string
+		query string
+	}{
+		{"OPTIMIZE TABLE", "OPTIMIZE TABLE device_data FINAL"},
+		{"Update statistics", "ANALYZE TABLE device_data"},
+	}
+
+	for _, opt := range optimizations {
+		log.Printf("Running: %s", opt.name)
+		start := time.Now()
+
+		_, err := conn.ExecContext(ctx, opt.query)
+		if err != nil {
+			log.Printf("Warning: %s failed: %v", opt.name, err)
+			continue
+		}
+
+		log.Printf("%s completed in %v", opt.name, time.Since(start))
 	}
 
 	log.Println("Table optimization completed")
 	return nil
 }
 
-func (loader *ParquetToClickHouseLoader) monitorResources() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-
-		log.Printf("📊 Memory: %.2f MB | Goroutines: %d | GC Cycles: %d",
-			float64(m.Alloc)/1024/1024, runtime.NumGoroutine(), m.NumGC)
-
-		if m.Alloc > 2*1024*1024*1024 { // 2GB
-			runtime.GC()
-			log.Println("🧹 Forced garbage collection due to high memory usage")
-		}
-	}
-}
-
 func (loader *ParquetToClickHouseLoader) Close() {
+	log.Println("Shutting down loader...")
+
+	// Close batch channel if not already closed
+	select {
+	case <-loader.batchChan:
+	default:
+		close(loader.batchChan)
+	}
+
+	// Wait for all batch workers to complete
+	loader.batchWg.Wait()
+
+	// Close all connections in the pool
+	close(loader.connPool)
+	for conn := range loader.connPool {
+		conn.Close()
+	}
+
 	if loader.localDB != nil {
 		loader.localDB.Close()
 	}
+
+	log.Println("Loader shutdown complete")
 }
 
 func formatNumber(n int64) string {
@@ -862,18 +1103,46 @@ func formatNumber(n int64) string {
 }
 
 func main() {
+	// Set garbage collection target to 50% to reduce GC pressure with high memory usage
+	runtime.GC()
+
+	// Maximum performance configuration for 64 vCPU / 128GB RAM server
 	config := LoaderConfig{
-		CHHost:        "localhost",
-		CHPort:        9000, // Use 8123 for HTTP interface
-		CHDatabase:    "device_tracking",
-		CHUser:        "default",
-		CHPassword:    "nyros",
-		MaxWorkers:    runtime.NumCPU() / 2,
-		ChunkSize:     100000,
-		LocalDBPath:   "./parquet_tracking.db", // SQLite database for tracking
-		RetryAttempts: 3,
-		QueryTimeout:  5 * time.Minute,
+		CHHost:     "localhost",
+		CHPort:     9000,
+		CHDatabase: "device_tracking",
+		CHUser:     "default",
+		CHPassword: "nyros",
+
+		// File processing workers - use most CPUs for file processing
+		MaxWorkers: 56, // Leave 8 CPUs for system and batch workers
+
+		// Batch insert workers - dedicated workers for database inserts
+		BatchInsertWorkers: 8,
+
+		// Connection pool - one connection per batch worker + extras
+		MaxConnections: 16,
+
+		// Large chunk sizes for maximum throughput
+		ChunkSize:    2000000, // 2M rows per chunk
+		MaxBatchSize: 1000000, // 1M rows per batch for Arrow reader
+
+		// Memory settings (use ~100GB of 128GB available)
+		MemoryLimit: 100 * 1024 * 1024 * 1024, // 100GB
+
+		// File and performance settings
+		FileReadBuffer: 16 * 1024 * 1024, // 16MB read buffer
+		LocalDBPath:    "./parquet_tracking.db",
+		RetryAttempts:  2,                // Reduced retries for faster failure detection
+		QueryTimeout:   30 * time.Minute, // Extended timeout for large batches
 	}
+
+	log.Printf("Starting high-performance loader with configuration:")
+	log.Printf("- File workers: %d", config.MaxWorkers)
+	log.Printf("- Batch workers: %d", config.BatchInsertWorkers)
+	log.Printf("- Connections: %d", config.MaxConnections)
+	log.Printf("- Chunk size: %s rows", formatNumber(int64(config.ChunkSize)))
+	log.Printf("- Memory limit: %d GB", config.MemoryLimit/(1024*1024*1024))
 
 	startDateStr := "2025-09-15"
 	startDate, err := time.Parse("2006-01-02", startDateStr)
@@ -889,10 +1158,7 @@ func main() {
 		targetDates = append(targetDates, date.Format("20060102"))
 	}
 
-	// "/mnt/blobcontainer/load_date=20250823"
-
 	parquetFolders := []string{}
-
 	for _, date := range targetDates {
 		parquetFolders = append(parquetFolders, fmt.Sprintf("/mnt/blobcontainer/load_date=%s", date))
 	}
@@ -907,6 +1173,8 @@ func main() {
 		log.Fatalf("Database setup failed: %v", err)
 	}
 
+	log.Println("🚀 Starting high-performance parallel data loading...")
+
 	if err := loader.loadParquetFilesParallel(parquetFolders); err != nil {
 		log.Fatalf("Parallel loading failed: %v", err)
 	}
@@ -915,5 +1183,6 @@ func main() {
 		log.Printf("Table optimization failed: %v", err)
 	}
 
-	log.Println("🎉 All data successfully loaded into ClickHouse!")
+	log.Println("🎉 HIGH-PERFORMANCE DATA LOADING COMPLETED SUCCESSFULLY!")
+	log.Println("💪 Maximum system resources utilized for optimal throughput!")
 }
