@@ -875,10 +875,26 @@ func main() {
 		QueryTimeout:  5 * time.Minute,
 	}
 
-	parquetFolders := []string{
-		"/mnt/blobcontainer/load_date=20250823",
-		//"/mnt/blobcontainer/load_date=20250822",
-		//"/mnt/blobcontainer/load_date=20250821",
+	startDateStr := "2025-09-15"
+	startDate, err := time.Parse("2006-01-02", startDateStr)
+	if err != nil {
+		panic(err)
+	}
+
+	n := 8
+
+	var targetDates []string
+	for i := 0; i < n; i++ {
+		date := startDate.AddDate(0, 0, -i) // subtract i days
+		targetDates = append(targetDates, date.Format("20060102"))
+	}
+
+	// "/mnt/blobcontainer/load_date=20250823"
+
+	parquetFolders := []string{}
+
+	for _, date := range targetDates {
+		parquetFolders = append(parquetFolders, fmt.Sprintf("/mnt/blobcontainer/load_date=%s", date))
 	}
 
 	loader, err := NewParquetToClickHouseLoader(config)
