@@ -98,6 +98,28 @@ type FileProcessResult struct {
 	StartTime      time.Time
 	WorkerID       int
 	Retried        bool
+	// Detailed timing breakdown
+	FileOpenTime    time.Duration
+	HashCalcTime    time.Duration
+	ParquetReadTime time.Duration
+	DataInsertTime  time.Duration
+	FileSize        int64
+}
+
+type FileProcessTiming struct {
+	FilePath      string
+	WorkerID      int
+	StartTime     time.Time
+	FileOpenStart time.Time
+	FileOpenEnd   time.Time
+	HashCalcStart time.Time
+	HashCalcEnd   time.Time
+	ParquetStart  time.Time
+	ParquetEnd    time.Time
+	InsertStart   time.Time
+	InsertEnd     time.Time
+	TotalEnd      time.Time
+	FileSize      int64
 }
 
 type DataBatch struct {
@@ -208,23 +230,29 @@ func (loader *ParquetToClickHouseLoader) startBatchInsertWorkers() {
 }
 
 func (loader *ParquetToClickHouseLoader) batchInsertWorker(workerID int) {
+	log.Printf("🚀 Batch worker %d started", workerID)
+
 	for batch := range loader.batchChan {
-		start := time.Now()
+		batchStart := time.Now()
 
 		conn := loader.getConnection()
 		err := loader.insertBatch(conn, batch)
 		loader.returnConnection(conn)
 
+		batchDuration := time.Since(batchStart)
+
 		if err != nil {
-			log.Printf("Batch insert worker %d failed: %v", workerID, err)
+			log.Printf("❌ Batch worker %d failed: batch_size=%d, time=%v, error=%v",
+				workerID, batch.Size, batchDuration, err)
 			// You might want to implement retry logic here
 		} else {
-			duration := time.Since(start)
-			rowsPerSec := float64(batch.Size) / duration.Seconds()
-			log.Printf("Worker %d: Inserted %d rows in %.2fs (%.0f rows/sec)",
-				workerID, batch.Size, duration.Seconds(), rowsPerSec)
+			rowsPerSec := float64(batch.Size) / batchDuration.Seconds()
+			log.Printf("✅ Batch worker %d: inserted %s rows in %v (%s rows/sec)",
+				workerID, formatNumber(int64(batch.Size)), batchDuration, formatNumber(int64(rowsPerSec)))
 		}
 	}
+
+	log.Printf("🏁 Batch worker %d finished", workerID)
 }
 
 func (loader *ParquetToClickHouseLoader) insertBatch(conn *sql.DB, batch *DataBatch) error {
@@ -523,31 +551,68 @@ func (loader *ParquetToClickHouseLoader) getParquetFiles(baseFolders []string) (
 }
 
 func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, loadDate time.Time) FileProcessResult {
-	result := FileProcessResult{
+	timing := FileProcessTiming{
 		FilePath:  filePath,
 		StartTime: time.Now(),
 	}
 
-	log.Printf("Processing file: %s", filepath.Base(filePath))
+	result := FileProcessResult{
+		FilePath:  filePath,
+		StartTime: timing.StartTime,
+	}
+
+	fileName := filepath.Base(filePath)
+	log.Printf("🔄 Worker starting file: %s", fileName)
+
+	// Get file size for throughput calculations
+	timing.FileOpenStart = time.Now()
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		result.Error = fmt.Errorf("failed to get file info: %w", err)
+		log.Printf("❌ Worker failed to get file info for %s: %v", fileName, err)
+		return result
+	}
+	timing.FileSize = fileInfo.Size()
+	result.FileSize = timing.FileSize
+	timing.FileOpenEnd = time.Now()
+	result.FileOpenTime = timing.FileOpenEnd.Sub(timing.FileOpenStart)
+
+	log.Printf("📁 Worker file info - %s: size=%s, opened in %v",
+		fileName, formatBytes(timing.FileSize), result.FileOpenTime)
 
 	// Check if file was already processed
+	timing.HashCalcStart = time.Now()
 	isProcessed, fileHash, err := loader.isFileProcessed(filePath)
+	timing.HashCalcEnd = time.Now()
+	result.HashCalcTime = timing.HashCalcEnd.Sub(timing.HashCalcStart)
+
 	if err != nil {
 		result.Error = fmt.Errorf("failed to check if file was processed: %w", err)
+		log.Printf("❌ Worker hash check failed for %s after %v: %v",
+			fileName, result.HashCalcTime, err)
 		return result
 	}
+
+	log.Printf("🔍 Worker hash check - %s: hash=%s, processed=%t, time=%v",
+		fileName, fileHash[:8], isProcessed, result.HashCalcTime)
 
 	if isProcessed {
-		log.Printf("Skipping already processed file: %s", filepath.Base(filePath))
+		log.Printf("⏭️  Worker skipping already processed file: %s (total time: %v)",
+			fileName, time.Since(timing.StartTime))
 		loader.stats.AddSkippedFile(filePath)
 		result.Success = true
+		result.ProcessingTime = time.Since(timing.StartTime)
 		return result
 	}
 
-	// Open parquet file with larger buffer
+	// Open and read parquet file
+	timing.ParquetStart = time.Now()
+	log.Printf("📖 Worker starting parquet read: %s", fileName)
+
 	osFile, err := os.OpenFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to open file: %w", err)
+		log.Printf("❌ Worker failed to open %s: %v", fileName, err)
 		return result
 	}
 	defer osFile.Close()
@@ -556,6 +621,7 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 	pf, err := file.NewParquetReader(osFile)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create parquet reader: %w", err)
+		log.Printf("❌ Worker failed to create parquet reader for %s: %v", fileName, err)
 		return result
 	}
 	defer pf.Close()
@@ -567,6 +633,7 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 	}, nil)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create arrow reader: %w", err)
+		log.Printf("❌ Worker failed to create arrow reader for %s: %v", fileName, err)
 		return result
 	}
 
@@ -574,6 +641,7 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 	schema, err := arrowReader.Schema()
 	if err != nil {
 		result.Error = fmt.Errorf("failed to get schema: %w", err)
+		log.Printf("❌ Worker failed to get schema for %s: %v", fileName, err)
 		return result
 	}
 
@@ -591,6 +659,7 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 
 	if len(columnIndices) != len(requiredColumns) {
 		result.Error = fmt.Errorf("not all required columns found in parquet file")
+		log.Printf("❌ Worker missing required columns in %s", fileName)
 		return result
 	}
 
@@ -598,54 +667,99 @@ func (loader *ParquetToClickHouseLoader) processSingleFile(filePath string, load
 	table, err := arrowReader.ReadTable(context.Background())
 	if err != nil {
 		result.Error = fmt.Errorf("failed to read table: %w", err)
+		log.Printf("❌ Worker failed to read table for %s: %v", fileName, err)
 		return result
 	}
 	defer table.Release()
 
 	numRows := int(table.NumRows())
+	timing.ParquetEnd = time.Now()
+	result.ParquetReadTime = timing.ParquetEnd.Sub(timing.ParquetStart)
+
+	log.Printf("📊 Worker parquet read complete - %s: rows=%s, time=%v, rate=%s rows/sec",
+		fileName, formatNumber(int64(numRows)), result.ParquetReadTime,
+		formatNumber(int64(float64(numRows)/result.ParquetReadTime.Seconds())))
+
 	if numRows == 0 {
-		log.Printf("Warning: Empty file: %s", filePath)
+		log.Printf("⚠️  Worker empty file: %s (total time: %v)", fileName, time.Since(timing.StartTime))
 
 		// Mark empty file as processed
 		if err := loader.markFileAsProcessed(filePath, fileHash, 0, loadDate.Format("20060102")); err != nil {
-			log.Printf("Warning: failed to mark empty file as processed: %v", err)
+			log.Printf("⚠️  Worker failed to mark empty file as processed %s: %v", fileName, err)
 		}
 
 		result.Success = true
+		result.ProcessingTime = time.Since(timing.StartTime)
 		return result
 	}
 
 	// Process with retry logic
+	timing.InsertStart = time.Now()
+	log.Printf("💾 Worker starting data insert: %s (%s rows)", fileName, formatNumber(int64(numRows)))
+
 	var rowsInserted int64
 	for attempt := 0; attempt <= loader.config.RetryAttempts; attempt++ {
 		if attempt > 0 {
-			log.Printf("Retry attempt %d for file: %s", attempt, filepath.Base(filePath))
+			log.Printf("🔄 Worker retry attempt %d for file: %s", attempt, fileName)
 			result.Retried = true
 			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 
+		attemptStart := time.Now()
 		rowsInserted, err = loader.insertTableData(table, loadDate)
+		attemptDuration := time.Since(attemptStart)
+
 		if err == nil {
+			log.Printf("✅ Worker insert successful - %s: inserted=%s rows, attempt=%d, time=%v, rate=%s rows/sec",
+				fileName, formatNumber(rowsInserted), attempt+1, attemptDuration,
+				formatNumber(int64(float64(rowsInserted)/attemptDuration.Seconds())))
 			break
 		}
 
+		log.Printf("❌ Worker insert attempt %d failed for %s after %v: %v",
+			attempt+1, fileName, attemptDuration, err)
+
 		if attempt == loader.config.RetryAttempts {
 			result.Error = fmt.Errorf("failed to insert data after %d attempts: %w", attempt+1, err)
+			timing.InsertEnd = time.Now()
+			result.DataInsertTime = timing.InsertEnd.Sub(timing.InsertStart)
+			log.Printf("💥 Worker final failure - %s: all %d attempts failed, total insert time=%v",
+				fileName, attempt+1, result.DataInsertTime)
 			return result
 		}
 	}
 
+	timing.InsertEnd = time.Now()
+	result.DataInsertTime = timing.InsertEnd.Sub(timing.InsertStart)
+
 	// Mark file as processed
+	markStart := time.Now()
 	if err := loader.markFileAsProcessed(filePath, fileHash, rowsInserted, loadDate.Format("20060102")); err != nil {
-		log.Printf("Warning: failed to mark file as processed: %v", err)
+		log.Printf("⚠️  Worker failed to mark file as processed %s: %v", fileName, err)
 	}
+	markDuration := time.Since(markStart)
 
 	result.RowsProcessed = rowsInserted
 	result.Success = true
-	result.ProcessingTime = time.Since(result.StartTime)
+	timing.TotalEnd = time.Now()
+	result.ProcessingTime = timing.TotalEnd.Sub(timing.StartTime)
 
-	log.Printf("Successfully processed %s: %d rows in %v",
-		filepath.Base(filePath), rowsInserted, result.ProcessingTime)
+	// Calculate throughput metrics
+	totalSeconds := result.ProcessingTime.Seconds()
+	rowsPerSec := float64(rowsInserted) / totalSeconds
+	bytesPerSec := float64(timing.FileSize) / totalSeconds
+
+	log.Printf("🎉 Worker COMPLETED - %s", fileName)
+	log.Printf("   📈 Summary: %s rows, %s, %v total",
+		formatNumber(rowsInserted), formatBytes(timing.FileSize), result.ProcessingTime)
+	log.Printf("   ⚡ Throughput: %s rows/sec, %s/sec",
+		formatNumber(int64(rowsPerSec)), formatBytes(int64(bytesPerSec)))
+	log.Printf("   🕐 Breakdown: open=%v, hash=%v, read=%v, insert=%v, mark=%v",
+		result.FileOpenTime, result.HashCalcTime, result.ParquetReadTime,
+		result.DataInsertTime, markDuration)
+	log.Printf("   📊 Efficiency: read=%.1f%%, insert=%.1f%% of total time",
+		result.ParquetReadTime.Seconds()/totalSeconds*100,
+		result.DataInsertTime.Seconds()/totalSeconds*100)
 
 	return result
 }
@@ -912,23 +1026,59 @@ func (loader *ParquetToClickHouseLoader) loadParquetFilesParallel(parquetFolders
 	}()
 
 	completed := 0
+	totalFilesCount := len(filesToProcess)
+	overallStart := time.Now()
+
 	for result := range resultsChan {
 		completed++
+		elapsed := time.Since(overallStart)
 
 		if result.Success {
 			loader.stats.IncrementProcessed()
 			loader.stats.AddRows(result.RowsProcessed)
+
+			// Calculate progress metrics
+			progressPct := float64(completed) / float64(totalFilesCount) * 100
+			avgTimePerFile := elapsed.Seconds() / float64(completed)
+			estimatedTotal := time.Duration(avgTimePerFile*float64(totalFilesCount)) * time.Second
+			eta := estimatedTotal - elapsed
+
 			retryStatus := ""
 			if result.Retried {
 				retryStatus = " (retried)"
 			}
-			log.Printf("✅ (%d/%d) Worker %d Completed: %s - %d rows in %.2fs%s",
-				completed, len(filesToProcess), result.WorkerID, filepath.Base(result.FilePath),
-				result.RowsProcessed, result.ProcessingTime.Seconds(), retryStatus)
+
+			// Calculate file throughput
+			totalSeconds := result.ProcessingTime.Seconds()
+			rowsPerSec := float64(result.RowsProcessed) / totalSeconds
+			mbPerSec := float64(result.FileSize) / totalSeconds / 1024 / 1024
+
+			log.Printf("✅ (%d/%d) %.1f%% Worker-%d: %s",
+				completed, totalFilesCount, progressPct, result.WorkerID, filepath.Base(result.FilePath))
+			log.Printf("   📊 %s rows, %s, %v (%s rows/sec, %.1f MB/sec)%s",
+				formatNumber(result.RowsProcessed), formatBytes(result.FileSize),
+				result.ProcessingTime, formatNumber(int64(rowsPerSec)), mbPerSec, retryStatus)
+			log.Printf("   🕐 Timing: open=%v, hash=%v, read=%v, insert=%v",
+				result.FileOpenTime, result.HashCalcTime, result.ParquetReadTime, result.DataInsertTime)
+
+			if completed < totalFilesCount {
+				log.Printf("   ⏱️  Progress: %v elapsed, ETA %v remaining",
+					elapsed.Round(time.Second), eta.Round(time.Second))
+			}
+
 		} else {
 			loader.stats.AddFailedFile(result.FilePath)
-			log.Printf("❌ (%d/%d) Worker %d Failed: %s - %v",
-				completed, len(filesToProcess), result.WorkerID, filepath.Base(result.FilePath), result.Error)
+			log.Printf("❌ (%d/%d) %.1f%% Worker-%d FAILED: %s - %v",
+				completed, totalFilesCount, float64(completed)/float64(totalFilesCount)*100,
+				result.WorkerID, filepath.Base(result.FilePath), result.Error)
+		}
+
+		// Log periodic summary
+		if completed%10 == 0 || completed == totalFilesCount {
+			processed, totalRows, _, _ := loader.stats.GetStats()
+			avgRowsPerSec := float64(totalRows) / elapsed.Seconds()
+			log.Printf("📈 PROGRESS SUMMARY: %d files done, %s total rows, %.0f rows/sec average",
+				processed, formatNumber(totalRows), avgRowsPerSec)
 		}
 	}
 
@@ -1088,6 +1238,19 @@ func (loader *ParquetToClickHouseLoader) Close() {
 	}
 
 	log.Println("Loader shutdown complete")
+}
+
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 func formatNumber(n int64) string {
