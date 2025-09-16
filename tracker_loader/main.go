@@ -366,8 +366,8 @@ func (loader *ParquetToClickHouseLoader) isFileProcessed(filePath string) (bool,
 
 	// If hashes match, file was already processed
 	if existingHash == currentHash {
-		log.Printf("File %s already processed at %s (hash: %s)",
-			filepath.Base(filePath), processedAt, currentHash[:8])
+		//log.Printf("File %s already processed at %s (hash: %s)",
+		//	filepath.Base(filePath), processedAt, currentHash[:8])
 		return true, currentHash, nil
 	}
 
