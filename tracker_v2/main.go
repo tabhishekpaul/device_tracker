@@ -22,7 +22,7 @@ import (
 
 const (
 	csvBatchSize        = 10000
-	workerPoolSize      = 8
+	workerPoolSize      = 20
 	clickhouseBatchSize = 300000
 )
 
