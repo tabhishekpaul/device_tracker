@@ -1267,7 +1267,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	today := time.Now()
 
 	dates := []string{
-		"2023-10-03",
+		"2025-10-03",
 	}
 
 	folderList := make([]string, 0, len(dates))
