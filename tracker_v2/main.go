@@ -12,19 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/arrow/go/v14/arrow"
-	"github.com/apache/arrow/go/v14/arrow/array"
-	"github.com/apache/arrow/go/v14/arrow/memory"
+	"github.com/apache/arrow/go/v14/parquet"
 	"github.com/apache/arrow/go/v14/parquet/file"
-	"github.com/apache/arrow/go/v14/parquet/pqarrow"
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/planar"
 )
 
 const (
-	jobBufferSize    = 1000
-	resultBufferSize = 1000
-	csvBatchSize     = 10000
+	csvBatchSize = 10000
 )
 
 type DeviceTracker struct {
@@ -49,8 +44,6 @@ type DeviceTracker struct {
 
 	IdleDeviceBuffer float64
 	NumWorkers       int
-
-	allocator memory.Allocator
 }
 
 type LocationRecord struct {
@@ -90,11 +83,10 @@ func NewDeviceTracker(locFolder, outputFolder string) *DeviceTracker {
 		OutTimeFiltered:    "Time_Filtered",
 		IdleDeviceBuffer:   10.0,
 		NumWorkers:         numWorkers,
-		allocator:          memory.NewGoAllocator(),
 	}
 }
 
-// Step 3: Campaign intersection detection
+// Step 3: Campaign intersection detection - SEQUENTIAL like Python
 func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string) error {
 	fmt.Println("(DT) Started step 3")
 	startTime := time.Now()
@@ -108,7 +100,7 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string)
 		return err
 	}
 
-	fmt.Printf("Total Files: %d, Workers: %d\n", len(fileList), dt.NumWorkers)
+	fmt.Printf("Total Files: %d\n", len(fileList))
 
 	targetFolder := filepath.Join(dt.OutputFolder, filepath.Base(parquetFolder))
 	os.MkdirAll(targetFolder, 0755)
@@ -116,107 +108,60 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string)
 	outCampaignCSV := filepath.Join(targetFolder, dt.OutCampaignDevices)
 	os.Remove(outCampaignCSV)
 
-	jobs := make(chan string, jobBufferSize)
-	results := make(chan []DeviceRecord, resultBufferSize)
+	// Process files sequentially like Python's multiprocessing approach
+	for i, parqFile := range fileList {
+		fmt.Printf("%d -- %s\n", i+1, filepath.Base(parqFile))
 
-	var wg sync.WaitGroup
-	var writerWg sync.WaitGroup
+		records, err := dt.processCampaignFile(parqFile)
+		if err != nil {
+			fmt.Printf("Error processing %s: %v\n", filepath.Base(parqFile), err)
+			continue
+		}
 
-	for w := 0; w < dt.NumWorkers; w++ {
-		wg.Add(1)
-		go dt.campaignWorker(&wg, jobs, results)
+		if len(records) > 0 {
+			dt.appendToCSV(outCampaignCSV, records)
+		}
 	}
 
-	writerWg.Add(1)
-	go dt.csvWriter(&writerWg, outCampaignCSV, results)
-
-	go func() {
-		for i, file := range fileList {
-			if i%100 == 0 {
-				fmt.Printf("Queued: %d/%d files\n", i, len(fileList))
-			}
-			jobs <- file
-		}
-		close(jobs)
-	}()
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	writerWg.Wait()
-
-	dt.removeCsvDuplicatesOptimized(outCampaignCSV)
+	if _, err := os.Stat(outCampaignCSV); err == nil {
+		dt.removeCsvDuplicatesOptimized(outCampaignCSV)
+	}
 
 	fmt.Printf("(DT) Completed step 3 in %v\n", time.Since(startTime))
 	return nil
 }
 
-func (dt *DeviceTracker) campaignWorker(wg *sync.WaitGroup, jobs <-chan string, results chan<- []DeviceRecord) {
-	defer wg.Done()
-
-	for parqFile := range jobs {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					fmt.Printf("Panic processing %s: %v\n", filepath.Base(parqFile), r)
-				}
-			}()
-
-			records, err := dt.processCampaignFile(parqFile)
-			if err != nil {
-				fmt.Printf("Error processing %s: %v\n", filepath.Base(parqFile), err)
-			} else if len(records) > 0 {
-				results <- records
-			}
-		}()
+func (dt *DeviceTracker) appendToCSV(csvPath string, records []DeviceRecord) error {
+	fileExists := false
+	if _, err := os.Stat(csvPath); err == nil {
+		fileExists = true
 	}
-}
 
-func (dt *DeviceTracker) csvWriter(wg *sync.WaitGroup, csvPath string, results <-chan []DeviceRecord) {
-	defer wg.Done()
-
-	file, err := os.Create(csvPath)
+	file, err := os.OpenFile(csvPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Printf("Error creating CSV: %v\n", err)
-		return
+		return err
 	}
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
-	writer.Write([]string{"device_id", "event_timestamp", "geometry", "address", "campaign"})
+	defer writer.Flush()
 
-	batch := make([][]string, 0, csvBatchSize)
-	totalRecords := 0
+	if !fileExists {
+		writer.Write([]string{"device_id", "event_timestamp", "geometry", "address", "campaign"})
+	}
 
-	for records := range results {
-		for i := range records {
-			row := []string{
-				records[i].DeviceID,
-				records[i].EventTimestamp.Format(time.RFC3339),
-				fmt.Sprintf("POINT (%f %f)", records[i].Longitude, records[i].Latitude),
-				records[i].Address,
-				records[i].Campaign,
-			}
-			batch = append(batch, row)
-
-			if len(batch) >= csvBatchSize {
-				writer.WriteAll(batch)
-				writer.Flush()
-				totalRecords += len(batch)
-				batch = batch[:0]
-			}
+	for i := range records {
+		row := []string{
+			records[i].DeviceID,
+			records[i].EventTimestamp.Format(time.RFC3339),
+			fmt.Sprintf("POINT (%f %f)", records[i].Longitude, records[i].Latitude),
+			records[i].Address,
+			records[i].Campaign,
 		}
+		writer.Write(row)
 	}
 
-	if len(batch) > 0 {
-		writer.WriteAll(batch)
-		writer.Flush()
-		totalRecords += len(batch)
-	}
-
-	fmt.Printf("Total records written: %d\n", totalRecords)
+	return nil
 }
 
 func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecord, error) {
@@ -230,8 +175,11 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecor
 		return nil, err
 	}
 
+	// Extract date from path - handles both "load_date=20231003" format
 	dateStr := dt.extractDateFromPath(parqFilePath)
 	insertDate, _ := time.Parse("20060102", dateStr)
+
+	fmt.Printf("Total Records -- %d\n", len(records))
 
 	intersectRecords := make([]DeviceRecord, 0, len(records)/10)
 
@@ -256,169 +204,197 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecor
 }
 
 func (dt *DeviceTracker) readParquetOptimized(filePath string, columns []string) ([]DeviceRecord, error) {
-	/*f, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()*/
-
 	pf, err := file.OpenParquetFile(filePath, false)
 	if err != nil {
 		return nil, err
 	}
 	defer pf.Close()
 
-	reader, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{}, dt.allocator)
-	if err != nil {
-		return nil, err
+	return dt.readParquetFromFile(pf, columns)
+}
+
+func (dt *DeviceTracker) readParquetFromFile(pf *file.Reader, columns []string) ([]DeviceRecord, error) {
+	numRowGroups := pf.NumRowGroups()
+	if numRowGroups == 0 {
+		return nil, nil
 	}
 
-	table, err := reader.ReadTable(dt.ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer table.Release()
+	records := make([]DeviceRecord, 0, 1000)
 
-	records := dt.extractRecordsOptimized(table)
+	// Read row groups one at a time
+	for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
+		rgRecords, err := dt.readRowGroup(pf, rgIdx)
+		if err != nil {
+			// Skip problematic row groups
+			continue
+		}
+		records = append(records, rgRecords...)
+	}
+
 	return records, nil
 }
 
-func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceRecord {
-	schema := table.Schema()
-	numRows := int(table.NumRows())
+func (dt *DeviceTracker) readRowGroup(pf *file.Reader, rgIdx int) ([]DeviceRecord, error) {
+	rg := pf.RowGroup(rgIdx)
+	numRows := int(rg.NumRows())
 
-	// Return early if no rows
 	if numRows == 0 {
-		return nil
-	}
-
-	deviceIDIdx := schema.FieldIndices(dt.DeviceIDColumn)
-	timeIdx := schema.FieldIndices(dt.TimeColumnName)
-	latIdx := schema.FieldIndices(dt.LatColumn)
-	lonIdx := schema.FieldIndices(dt.LonColumn)
-
-	if len(deviceIDIdx) == 0 || len(timeIdx) == 0 || len(latIdx) == 0 || len(lonIdx) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	records := make([]DeviceRecord, 0, numRows)
 
-	deviceIDCol := table.Column(deviceIDIdx[0])
-	timeCol := table.Column(timeIdx[0])
-	latCol := table.Column(latIdx[0])
-	lonCol := table.Column(lonIdx[0])
+	// Find column indices
+	schema := pf.MetaData().Schema
+	deviceIDIdx := -1
+	timeIdx := -1
+	latIdx := -1
+	lonIdx := -1
 
-	// Safety check: ensure columns exist
-	if deviceIDCol == nil || timeCol == nil || latCol == nil || lonCol == nil {
-		return nil
-	}
+	for i := 0; i < schema.NumColumns(); i++ {
+		col := schema.Column(i)
+		name := col.Name()
 
-	deviceIDData := deviceIDCol.Data()
-	timeData := timeCol.Data()
-	latData := latCol.Data()
-	lonData := lonCol.Data()
-
-	// Safety check: ensure data chunks exist
-	if deviceIDData == nil || timeData == nil || latData == nil || lonData == nil {
-		return nil
-	}
-
-	// Find minimum chunk count across all columns
-	minChunks := deviceIDData.Len()
-	if timeData.Len() < minChunks {
-		minChunks = timeData.Len()
-	}
-	if latData.Len() < minChunks {
-		minChunks = latData.Len()
-	}
-	if lonData.Len() < minChunks {
-		minChunks = lonData.Len()
-	}
-
-	// Return early if no chunks
-	if minChunks == 0 {
-		return nil
-	}
-
-	for chunkIdx := 0; chunkIdx < minChunks; chunkIdx++ {
-		// Additional safety: verify chunk index is valid for each column
-		if chunkIdx >= deviceIDData.Len() || chunkIdx >= timeData.Len() ||
-			chunkIdx >= latData.Len() || chunkIdx >= lonData.Len() {
-			break
+		if name == dt.DeviceIDColumn {
+			deviceIDIdx = i
+		} else if name == dt.TimeColumnName {
+			timeIdx = i
+		} else if name == dt.LatColumn {
+			latIdx = i
+		} else if name == dt.LonColumn {
+			lonIdx = i
 		}
+	}
 
-		deviceChunk := deviceIDData.Chunk(chunkIdx)
-		timeChunk := timeData.Chunk(chunkIdx)
-		latChunk := latData.Chunk(chunkIdx)
-		lonChunk := lonData.Chunk(chunkIdx)
+	if deviceIDIdx == -1 || timeIdx == -1 || latIdx == -1 || lonIdx == -1 {
+		return nil, fmt.Errorf("required columns not found")
+	}
 
-		// Safety check: ensure chunks are valid
-		if deviceChunk == nil || timeChunk == nil || latChunk == nil || lonChunk == nil {
-			continue
-		}
+	// Read columns
+	deviceIDs := dt.readStringColumn(rg, deviceIDIdx, numRows)
+	timestamps := dt.readTimestampColumn(rg, timeIdx, numRows)
+	latitudes := dt.readFloatColumn(rg, latIdx, numRows)
+	longitudes := dt.readFloatColumn(rg, lonIdx, numRows)
 
-		// Find minimum length across all chunks
-		chunkLen := deviceChunk.Len()
-		if timeChunk.Len() < chunkLen {
-			chunkLen = timeChunk.Len()
-		}
-		if latChunk.Len() < chunkLen {
-			chunkLen = latChunk.Len()
-		}
-		if lonChunk.Len() < chunkLen {
-			chunkLen = lonChunk.Len()
-		}
-
-		for i := 0; i < chunkLen; i++ {
-			if deviceChunk.IsNull(i) || timeChunk.IsNull(i) || latChunk.IsNull(i) || lonChunk.IsNull(i) {
-				continue
+	// Build records
+	for i := 0; i < numRows; i++ {
+		if i < len(deviceIDs) && i < len(timestamps) && i < len(latitudes) && i < len(longitudes) {
+			rec := DeviceRecord{
+				DeviceID:       deviceIDs[i],
+				EventTimestamp: timestamps[i],
+				Latitude:       latitudes[i],
+				Longitude:      longitudes[i],
 			}
-
-			rec := DeviceRecord{}
-
-			switch arr := deviceChunk.(type) {
-			case *array.String:
-				rec.DeviceID = arr.Value(i)
-			case *array.Binary:
-				rec.DeviceID = string(arr.Value(i))
-			case *array.LargeString:
-				rec.DeviceID = arr.Value(i)
-			default:
-				continue
-			}
-
-			switch arr := timeChunk.(type) {
-			case *array.Timestamp:
-				rec.EventTimestamp = arr.Value(i).ToTime(arrow.Nanosecond)
-			case *array.Int64:
-				rec.EventTimestamp = time.Unix(arr.Value(i), 0)
-			default:
-				continue
-			}
-
-			switch arr := latChunk.(type) {
-			case *array.Float64:
-				rec.Latitude = arr.Value(i)
-			case *array.Float32:
-				rec.Latitude = float64(arr.Value(i))
-			default:
-				continue
-			}
-
-			switch arr := lonChunk.(type) {
-			case *array.Float64:
-				rec.Longitude = arr.Value(i)
-			case *array.Float32:
-				rec.Longitude = float64(arr.Value(i))
-			default:
-				continue
-			}
-
 			records = append(records, rec)
 		}
 	}
 
-	return records
+	return records, nil
+}
+
+func (dt *DeviceTracker) readStringColumn(rg *file.RowGroupReader, colIdx int, numRows int) []string {
+	defer func() {
+		if r := recover(); r != nil {
+			// Recover from panics
+		}
+	}()
+
+	col, err := rg.Column(colIdx)
+	if err != nil {
+		return make([]string, numRows)
+	}
+
+	result := make([]string, 0, numRows)
+
+	switch reader := col.(type) {
+	case *file.ByteArrayColumnChunkReader:
+		values := make([]parquet.ByteArray, 1024)
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, nil, nil)
+			if n == 0 {
+				break
+			}
+			for i := 0; i < int(n); i++ {
+				result = append(result, string(values[i]))
+			}
+		}
+	}
+
+	return result
+}
+
+func (dt *DeviceTracker) readTimestampColumn(rg *file.RowGroupReader, colIdx int, numRows int) []time.Time {
+	defer func() {
+		if r := recover(); r != nil {
+			// Recover from panics
+		}
+	}()
+
+	col, err := rg.Column(colIdx)
+	if err != nil {
+		return make([]time.Time, numRows)
+	}
+
+	result := make([]time.Time, 0, numRows)
+
+	switch reader := col.(type) {
+	case *file.Int64ColumnChunkReader:
+		values := make([]int64, 1024)
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, nil, nil)
+			if n == 0 {
+				break
+			}
+			for i := 0; i < int(n); i++ {
+				// Assume microseconds since epoch
+				result = append(result, time.Unix(0, values[i]*1000))
+			}
+		}
+	}
+
+	return result
+}
+
+func (dt *DeviceTracker) readFloatColumn(rg *file.RowGroupReader, colIdx int, numRows int) []float64 {
+	defer func() {
+		if r := recover(); r != nil {
+			// Recover from panics
+		}
+	}()
+
+	col, err := rg.Column(colIdx)
+	if err != nil {
+		return make([]float64, numRows)
+	}
+
+	result := make([]float64, 0, numRows)
+
+	switch reader := col.(type) {
+	case *file.Float64ColumnChunkReader:
+		values := make([]float64, 1024)
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, nil, nil)
+			if n == 0 {
+				break
+			}
+			for i := 0; i < int(n); i++ {
+				result = append(result, values[i])
+			}
+		}
+	case *file.Float32ColumnChunkReader:
+		values := make([]float32, 1024)
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, nil, nil)
+			if n == 0 {
+				break
+			}
+			for i := 0; i < int(n); i++ {
+				result = append(result, float64(values[i]))
+			}
+		}
+	}
+
+	return result
 }
 
 // Step 4: Merge campaign intersections
@@ -431,53 +407,32 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsCSV(folderList []string, fold
 	os.Remove(outCSV)
 	os.Remove(allCSV)
 
-	type result struct {
-		records []DeviceRecord
-		err     error
-	}
-
-	results := make(chan result, len(folderList))
-	var wg sync.WaitGroup
+	var allRecords []DeviceRecord
 
 	for _, folder := range folderList {
-		wg.Add(1)
-		go func(f string) {
-			defer wg.Done()
+		targetFolder := filepath.Join(dt.OutputFolder, folderPrefix+folder)
+		inCSV := filepath.Join(targetFolder, dt.OutCampaignDevices)
 
-			targetFolder := filepath.Join(dt.OutputFolder, folderPrefix+f)
-			inCSV := filepath.Join(targetFolder, dt.OutCampaignDevices)
-
-			records, err := dt.readDeviceCSV(inCSV)
-			if err != nil {
-				results <- result{nil, err}
-				return
-			}
-
-			dateStr := f[len(f)-8:]
-			insertDate, _ := time.Parse("20060102", dateStr)
-
-			for i := range records {
-				records[i].InsertDate = insertDate
-			}
-
-			results <- result{records, nil}
-		}(folder)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var allRecords []DeviceRecord
-	for res := range results {
-		if res.err == nil && res.records != nil {
-			allRecords = append(allRecords, res.records...)
+		records, err := dt.readDeviceCSV(inCSV)
+		if err != nil {
+			continue
 		}
+
+		// Extract date from folder name
+		dateStr := folder[len(folder)-8:]
+		insertDate, _ := time.Parse("20060102", dateStr)
+
+		for i := range records {
+			records[i].InsertDate = insertDate
+		}
+
+		allRecords = append(allRecords, records...)
 	}
 
+	// Write all devices before deduplication
 	dt.writeDeviceCSVOptimized(allCSV, allRecords)
 
+	// Deduplicate by device_id only
 	seen := make(map[string]struct{}, len(allRecords))
 	uniqueRecords := make([]DeviceRecord, 0, len(allRecords)/2)
 
@@ -495,7 +450,7 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsCSV(folderList []string, fold
 	return nil
 }
 
-// Step 5: Filter by time
+// Step 5: Filter by time - with concurrent processing
 func (dt *DeviceTracker) FilterTargetTime(dateFolder string, targetDates []string, skipTimezoneError bool) error {
 	fmt.Println("(DT) Started step 5")
 	startTime := time.Now()
@@ -503,7 +458,7 @@ func (dt *DeviceTracker) FilterTargetTime(dateFolder string, targetDates []strin
 	targetFolder := filepath.Join(dt.OutputFolder, filepath.Base(dateFolder))
 	os.MkdirAll(targetFolder, 0755)
 
-	fileList, err := filepath.Glob(filepath.Join(dateFolder, "*.parquet"))
+	fileList, err := filepath.Glob(filepath.Join(dateFolder, "/*.parquet"))
 	if err != nil {
 		return err
 	}
@@ -528,47 +483,27 @@ func (dt *DeviceTracker) FilterTargetTime(dateFolder string, targetDates []strin
 		endTimeFilter, _ := time.Parse("2006-01-02 15:04:05", targetDate+" "+dt.FilterOutTime)
 
 		var allFiltered []DeviceRecord
-		var mu sync.Mutex
 
-		jobs := make(chan string, jobBufferSize)
-		var wg sync.WaitGroup
+		for _, parqFile := range fileList {
+			records, err := dt.readParquetOptimized(parqFile, nil)
+			if err != nil {
+				if !skipTimezoneError {
+					fmt.Printf("Error: %v\n", err)
+				}
+				continue
+			}
 
-		for w := 0; w < dt.NumWorkers; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for parqFile := range jobs {
-					records, err := dt.readParquetOptimized(parqFile, nil)
-					if err != nil {
-						if !skipTimezoneError {
-							fmt.Printf("Error: %v\n", err)
-						}
-						continue
-					}
-
-					filtered := make([]DeviceRecord, 0)
-					for i := range records {
-						if _, exists := idSet[records[i].DeviceID]; exists {
-							if records[i].EventTimestamp.After(startTimeFilter) && records[i].EventTimestamp.Before(endTimeFilter) {
-								filtered = append(filtered, records[i])
-							}
-						}
-					}
-
-					if len(filtered) > 0 {
-						mu.Lock()
-						allFiltered = append(allFiltered, filtered...)
-						mu.Unlock()
+			filtered := make([]DeviceRecord, 0)
+			for i := range records {
+				if _, exists := idSet[records[i].DeviceID]; exists {
+					if records[i].EventTimestamp.After(startTimeFilter) && records[i].EventTimestamp.Before(endTimeFilter) {
+						filtered = append(filtered, records[i])
 					}
 				}
-			}()
-		}
+			}
 
-		for _, file := range fileList {
-			jobs <- file
+			allFiltered = append(allFiltered, filtered...)
 		}
-		close(jobs)
-		wg.Wait()
 
 		allFiltered = dt.deduplicateRecords(allFiltered)
 		fmt.Printf("Date %s: %d records\n", targetDate, len(allFiltered))
@@ -580,7 +515,7 @@ func (dt *DeviceTracker) FilterTargetTime(dateFolder string, targetDates []strin
 	return nil
 }
 
-// Step 6: Idle device search - MAIN FOCUS
+// Step 6: Idle device search
 func (dt *DeviceTracker) RunIdleDeviceSearch(folderList, targetDates []string) error {
 	fmt.Println("(DT) Started step 6")
 	startTime := time.Now()
@@ -608,107 +543,74 @@ func (dt *DeviceTracker) findIdleDevicesOptimized(folderList []string, targetDat
 		return err
 	}
 
-	uniqDeviceMap := make(map[string]DeviceRecord, len(uIdDataFrame))
+	// Create map for quick lookup with deduplication
+	uniqDeviceMap := make(map[string]DeviceRecord)
 	for i := range uIdDataFrame {
 		uniqDeviceMap[uIdDataFrame[i].DeviceID] = uIdDataFrame[i]
 	}
 
 	var allRecords []DeviceRecord
-	var mu sync.Mutex
-	var wg sync.WaitGroup
 
 	for _, folderName := range folderList {
-		wg.Add(1)
-		go func(folder string) {
-			defer wg.Done()
+		csvPath := filepath.Join(dt.OutputFolder, folderName, fmt.Sprintf("%s_%s.csv", dt.OutTimeFiltered, targetDate))
+		if _, err := os.Stat(csvPath); os.IsNotExist(err) {
+			continue
+		}
 
-			csvPath := filepath.Join(dt.OutputFolder, folder, fmt.Sprintf("%s_%s.csv", dt.OutTimeFiltered, targetDate))
-			if _, err := os.Stat(csvPath); os.IsNotExist(err) {
-				return
-			}
+		records, err := dt.readDeviceCSV(csvPath)
+		if err != nil {
+			continue
+		}
 
-			records, err := dt.readDeviceCSV(csvPath)
-			if err != nil {
-				return
-			}
-
-			mu.Lock()
-			allRecords = append(allRecords, records...)
-			mu.Unlock()
-		}(folderName)
+		allRecords = append(allRecords, records...)
 	}
-
-	wg.Wait()
 
 	if len(allRecords) == 0 {
 		return nil
 	}
 
+	// Group by device ID
 	deviceGroups := make(map[string][]DeviceRecord)
 	for i := range allRecords {
 		id := allRecords[i].DeviceID
 		deviceGroups[id] = append(deviceGroups[id], allRecords[i])
 	}
 
-	deviceIDs := make([]string, 0, len(deviceGroups))
-	for id := range deviceGroups {
-		deviceIDs = append(deviceIDs, id)
-	}
+	idleDevices := make([]DeviceRecord, 0)
 
-	idleDevices := make([]DeviceRecord, 0, len(deviceIDs)/10)
-	var idleMu sync.Mutex
+	for deviceID, deviceDF := range deviceGroups {
+		if len(deviceDF) == 0 {
+			continue
+		}
 
-	jobs := make(chan string, jobBufferSize)
-	var detectWg sync.WaitGroup
+		campRec, exists := uniqDeviceMap[deviceID]
+		if !exists {
+			//fmt.Printf("[WARN] No metadata found for device_id=%s on date=%s\n", deviceID, targetDate)
+			continue
+		}
 
-	for w := 0; w < dt.NumWorkers; w++ {
-		detectWg.Add(1)
-		go func() {
-			defer detectWg.Done()
+		firstRec := deviceDF[0]
+		firstPoint := orb.Point{firstRec.Longitude, firstRec.Latitude}
+		bufferPolygon := dt.createBufferOptimized(firstPoint, dt.IdleDeviceBuffer)
 
-			for deviceID := range jobs {
-				deviceDF := deviceGroups[deviceID]
-				if len(deviceDF) == 0 {
-					continue
-				}
-
-				campRec, exists := uniqDeviceMap[deviceID]
-				if !exists {
-					continue
-				}
-
-				firstRec := deviceDF[0]
-				firstPoint := orb.Point{firstRec.Longitude, firstRec.Latitude}
-				bufferPolygon := dt.createBufferOptimized(firstPoint, dt.IdleDeviceBuffer)
-
-				isIdle := true
-				for i := range deviceDF {
-					point := orb.Point{deviceDF[i].Longitude, deviceDF[i].Latitude}
-					if !planar.PolygonContains(bufferPolygon, point) {
-						isIdle = false
-						break
-					}
-				}
-
-				if isIdle {
-					idleRec := firstRec
-					idleRec.Campaign = campRec.Campaign
-					idleRec.Address = campRec.Address
-					idleRec.EventTimestamp = campRec.EventTimestamp
-
-					idleMu.Lock()
-					idleDevices = append(idleDevices, idleRec)
-					idleMu.Unlock()
-				}
+		isIdle := true
+		for i := range deviceDF {
+			point := orb.Point{deviceDF[i].Longitude, deviceDF[i].Latitude}
+			if !planar.PolygonContains(bufferPolygon, point) {
+				isIdle = false
+				break
 			}
-		}()
-	}
+		}
 
-	for _, id := range deviceIDs {
-		jobs <- id
+		if isIdle {
+			idleRec := firstRec
+			idleRec.Campaign = campRec.Campaign
+			idleRec.Address = campRec.Address
+			idleRec.EventTimestamp = campRec.EventTimestamp // visited_time
+
+			idleDevices = append(idleDevices, idleRec)
+		}
 	}
-	close(jobs)
-	detectWg.Wait()
 
 	outCSV := filepath.Join(dt.OutputFolder, fmt.Sprintf("%s_%s.csv", dt.OutTargetDevices, targetDate))
 	if len(idleDevices) > 0 {
@@ -739,6 +641,7 @@ func (dt *DeviceTracker) mergeIdleDevicesOutput(targetDates []string) error {
 		return nil
 	}
 
+	// Deduplicate by device_id AND campaign
 	seen := make(map[string]struct{})
 	unique := make([]DeviceRecord, 0, len(allRecords))
 
