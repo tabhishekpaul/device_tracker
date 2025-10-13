@@ -76,6 +76,7 @@ func NewDeviceTracker(locFolder, outputFolder string) *DeviceTracker {
 	}
 
 	return &DeviceTracker{
+		ctx:                context.Background(),
 		FilterInTime:       "02:00:00",
 		FilterOutTime:      "04:30:00",
 		TimeColumnName:     "event_timestamp",
@@ -90,7 +91,6 @@ func NewDeviceTracker(locFolder, outputFolder string) *DeviceTracker {
 		IdleDeviceBuffer:   10.0,
 		NumWorkers:         numWorkers,
 		allocator:          memory.NewGoAllocator(),
-		ctx:                context.Background(),
 	}
 }
 
@@ -948,8 +948,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	today := time.Now()
 
 	dates := []string{
-		"2025-08-21", "2025-08-20", "2025-08-19", "2025-08-18",
-		"2025-08-17", "2025-08-16", "2025-08-15", "2025-08-14",
+		"2023-10-03",
 	}
 
 	folderList := make([]string, 0, len(dates))
@@ -982,7 +981,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 				fmt.Printf("Error in step 3: %v\n", err)
 			}
 		}
-		fmt.Println("Step 3 Completed\n")
+		fmt.Println("Step 3 Completed")
 	}
 
 	if containsStep(runSteps, 4) {
@@ -991,7 +990,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 		if err != nil {
 			fmt.Printf("Error in step 4: %v\n", err)
 		}
-		fmt.Println("Step 4 Completed\n")
+		fmt.Println("Step 4 Completed")
 	}
 
 	if containsStep(runSteps, 5) {
@@ -1005,7 +1004,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 				fmt.Printf("Error in step 5 for %s: %v\n", folder, err)
 			}
 		}
-		fmt.Println("Step 5 Completed\n")
+		fmt.Println("Step 5 Completed")
 	}
 
 	if containsStep(runSteps, 6) {
@@ -1015,7 +1014,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 			fmt.Printf("Error in step 6: %v\n", err)
 			return err
 		}
-		fmt.Println("Step 6 Completed\n")
+		fmt.Println("Step 6 Completed")
 	}
 
 	return nil
@@ -1033,11 +1032,11 @@ func containsStep(steps []int, step int) bool {
 func main() {
 	fmt.Println("===========================================")
 	fmt.Println("   Device Tracker - High Performance")
-	fmt.Println("===========================================\n")
+	fmt.Println("===========================================")
 
 	startTime := time.Now()
 
-	runSteps := []int{6}
+	runSteps := []int{3, 4, 5, 6}
 
 	err := RunDeviceTracker(true, false, runSteps)
 	if err != nil {
