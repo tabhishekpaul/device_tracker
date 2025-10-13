@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"os"
@@ -27,6 +28,7 @@ const (
 )
 
 type DeviceTracker struct {
+	ctx           context.Context
 	FilterInTime  string
 	FilterOutTime string
 
@@ -88,6 +90,7 @@ func NewDeviceTracker(locFolder, outputFolder string) *DeviceTracker {
 		IdleDeviceBuffer:   10.0,
 		NumWorkers:         numWorkers,
 		allocator:          memory.NewGoAllocator(),
+		ctx:                context.Background(),
 	}
 }
 
@@ -262,7 +265,7 @@ func (dt *DeviceTracker) readParquetOptimized(filePath string, columns []string)
 		return nil, err
 	}
 
-	table, err := reader.ReadTable(nil)
+	table, err := reader.ReadTable(dt.ctx)
 	if err != nil {
 		return nil, err
 	}
