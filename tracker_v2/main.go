@@ -23,7 +23,7 @@ import (
 const (
 	csvBatchSize        = 10000
 	workerPoolSize      = 8
-	clickhouseBatchSize = 25000
+	clickhouseBatchSize = 300000
 )
 
 type ClickHouseConfig struct {
