@@ -39,6 +39,14 @@ type DeviceTracker struct {
 	FilterInTime  string
 	FilterOutTime string
 
+	// Parsed filter times (hour, minute, second only)
+	filterStartHour int
+	filterStartMin  int
+	filterStartSec  int
+	filterEndHour   int
+	filterEndMin    int
+	filterEndSec    int
+
 	TimeColumnName string
 	DeviceIDColumn string
 	LatColumn      string
@@ -62,7 +70,6 @@ type DeviceTracker struct {
 	clickhouseConn *sql.DB
 	chMutex        sync.Mutex
 	chBatch        []TimeFilteredRecord
-	targetDates    []TimeFilterPeriod
 }
 
 type LocationRecord struct {
@@ -121,7 +128,7 @@ func NewDeviceTracker(locFolder, outputFolder string, chConfig ClickHouseConfig)
 
 	fmt.Println("Successfully connected to ClickHouse")
 
-	return &DeviceTracker{
+	dt := &DeviceTracker{
 		ctx:                context.Background(),
 		FilterInTime:       "02:00:00",
 		FilterOutTime:      "04:30:00",
@@ -138,7 +145,65 @@ func NewDeviceTracker(locFolder, outputFolder string, chConfig ClickHouseConfig)
 		spatialIndex:       make(map[int][]int),
 		clickhouseConn:     conn,
 		chBatch:            make([]TimeFilteredRecord, 0, clickhouseBatchSize),
-	}, nil
+	}
+
+	// Parse filter times once
+	if err := dt.parseFilterTimes(); err != nil {
+		return nil, fmt.Errorf("failed to parse filter times: %w", err)
+	}
+
+	return dt, nil
+}
+
+func (dt *DeviceTracker) parseFilterTimes() error {
+	// Parse start time
+	startParts := strings.Split(dt.FilterInTime, ":")
+	if len(startParts) != 3 {
+		return fmt.Errorf("invalid FilterInTime format: %s", dt.FilterInTime)
+	}
+
+	var err error
+	dt.filterStartHour, err = strconv.Atoi(startParts[0])
+	if err != nil {
+		return fmt.Errorf("invalid start hour: %w", err)
+	}
+
+	dt.filterStartMin, err = strconv.Atoi(startParts[1])
+	if err != nil {
+		return fmt.Errorf("invalid start minute: %w", err)
+	}
+
+	dt.filterStartSec, err = strconv.Atoi(startParts[2])
+	if err != nil {
+		return fmt.Errorf("invalid start second: %w", err)
+	}
+
+	// Parse end time
+	endParts := strings.Split(dt.FilterOutTime, ":")
+	if len(endParts) != 3 {
+		return fmt.Errorf("invalid FilterOutTime format: %s", dt.FilterOutTime)
+	}
+
+	dt.filterEndHour, err = strconv.Atoi(endParts[0])
+	if err != nil {
+		return fmt.Errorf("invalid end hour: %w", err)
+	}
+
+	dt.filterEndMin, err = strconv.Atoi(endParts[1])
+	if err != nil {
+		return fmt.Errorf("invalid end minute: %w", err)
+	}
+
+	dt.filterEndSec, err = strconv.Atoi(endParts[2])
+	if err != nil {
+		return fmt.Errorf("invalid end second: %w", err)
+	}
+
+	fmt.Printf("Time filter configured: %02d:%02d:%02d to %02d:%02d:%02d\n",
+		dt.filterStartHour, dt.filterStartMin, dt.filterStartSec,
+		dt.filterEndHour, dt.filterEndMin, dt.filterEndSec)
+
+	return nil
 }
 
 func (dt *DeviceTracker) Close() error {
@@ -158,38 +223,24 @@ func (dt *DeviceTracker) Close() error {
 	return nil
 }
 
-func (dt *DeviceTracker) setTargetDates(dates []string) error {
-	dt.targetDates = make([]TimeFilterPeriod, 0, len(dates))
-
-	for _, dateStr := range dates {
-		startTime, err := time.Parse("2006-01-02 15:04:05", dateStr+" "+dt.FilterInTime)
-		if err != nil {
-			return fmt.Errorf("failed to parse start time for %s: %w", dateStr, err)
-		}
-
-		endTime, err := time.Parse("2006-01-02 15:04:05", dateStr+" "+dt.FilterOutTime)
-		if err != nil {
-			return fmt.Errorf("failed to parse end time for %s: %w", dateStr, err)
-		}
-
-		dt.targetDates = append(dt.targetDates, TimeFilterPeriod{
-			StartTime: startTime,
-			EndTime:   endTime,
-		})
-
-		fmt.Printf("Added time filter: %s to %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
-	}
-
-	return nil
-}
-
 func (dt *DeviceTracker) isWithinTimeFilter(eventTime time.Time) bool {
-	for _, period := range dt.targetDates {
-		if eventTime.After(period.StartTime) && eventTime.Before(period.EndTime) {
-			return true
-		}
+	hour := eventTime.Hour()
+	min := eventTime.Minute()
+	sec := eventTime.Second()
+
+	// Convert to total seconds for easy comparison
+	eventSeconds := hour*3600 + min*60 + sec
+	startSeconds := dt.filterStartHour*3600 + dt.filterStartMin*60 + dt.filterStartSec
+	endSeconds := dt.filterEndHour*3600 + dt.filterEndMin*60 + dt.filterEndSec
+
+	// Simple case: start < end (e.g., 02:00:00 to 04:30:00)
+	if startSeconds < endSeconds {
+		return eventSeconds >= startSeconds && eventSeconds < endSeconds
 	}
-	return false
+
+	// Cross-midnight case: start > end (e.g., 22:00:00 to 02:00:00)
+	// Event is valid if it's after start OR before end
+	return eventSeconds >= startSeconds || eventSeconds < endSeconds
 }
 
 func (dt *DeviceTracker) addToClickHouseBatch(record TimeFilteredRecord) error {
@@ -1308,11 +1359,6 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 		return fmt.Errorf("failed to create device tracker: %w", err)
 	}
 	defer dt.Close()
-
-	// Set target dates for time filtering
-	if err := dt.setTargetDates(dates); err != nil {
-		return fmt.Errorf("failed to set target dates: %w", err)
-	}
 
 	if containsStep(runSteps, 3) {
 		fmt.Println("\n========== Running STEP 3 ==========")
