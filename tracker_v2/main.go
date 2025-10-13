@@ -473,25 +473,26 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecor
 
 	for i := range records {
 		records[i].InsertDate = insertDate
+
+		if dt.isWithinTimeFilter(records[i].EventTimestamp) {
+			tfRecord := TimeFilteredRecord{
+				DeviceID:       records[i].DeviceID,
+				EventTimestamp: records[i].EventTimestamp,
+				Latitude:       records[i].Latitude,
+				Longitude:      records[i].Longitude,
+				LoadDate:       loadDate,
+			}
+
+			if err := dt.addToClickHouseBatch(tfRecord); err != nil {
+				fmt.Printf("Error adding to ClickHouse batch: %v\n", err)
+			}
+		}
+
 		point := orb.Point{records[i].Longitude, records[i].Latitude}
 
 		candidates := dt.findIntersectingPolygons(records[i].Longitude, records[i].Latitude)
 
 		for _, idx := range candidates {
-
-			if dt.isWithinTimeFilter(records[i].EventTimestamp) {
-				tfRecord := TimeFilteredRecord{
-					DeviceID:       records[i].DeviceID,
-					EventTimestamp: records[i].EventTimestamp,
-					Latitude:       records[i].Latitude,
-					Longitude:      records[i].Longitude,
-					LoadDate:       loadDate,
-				}
-
-				if err := dt.addToClickHouseBatch(tfRecord); err != nil {
-					fmt.Printf("Error adding to ClickHouse batch: %v\n", err)
-				}
-			}
 
 			if !dt.LocData[idx].Bounds.Contains(point) {
 				continue
