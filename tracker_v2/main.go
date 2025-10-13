@@ -250,7 +250,6 @@ func (dt *DeviceTracker) flushClickHouseBatchUnsafe() error {
 
 	fmt.Printf("Flushed %d records to ClickHouse\n", len(dt.chBatch))
 
-	// Clear the batch
 	dt.chBatch = dt.chBatch[:0]
 
 	return nil
