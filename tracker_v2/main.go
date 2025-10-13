@@ -110,8 +110,8 @@ func (dt *DeviceTracker) buildSpatialIndex() {
 		dt.LocData[i].Bounds = bounds
 
 		// Add to multiple grid cells if polygon spans them
-		minKey := dt.getSpatialKey(bounds.Min[0], bounds.Min[1])
-		maxKey := dt.getSpatialKey(bounds.Max[0], bounds.Max[1])
+		//minKey := dt.getSpatialKey(bounds.Min[0], bounds.Min[1])
+		//maxKey := dt.getSpatialKey(bounds.Max[0], bounds.Max[1])
 
 		minX := int(bounds.Min[0] / 0.01)
 		maxX := int(bounds.Max[0] / 0.01)
