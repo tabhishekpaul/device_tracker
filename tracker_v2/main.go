@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/apache/arrow/go/v14/parquet"
 	"github.com/apache/arrow/go/v14/parquet/file"
 	"github.com/paulmach/orb"
@@ -19,10 +21,19 @@ import (
 )
 
 const (
-	csvBatchSize     = 10000
-	workerPoolSize   = 8
-	recordBufferSize = 100000
+	csvBatchSize        = 10000
+	workerPoolSize      = 8
+	recordBufferSize    = 100000
+	clickhouseBatchSize = 25000
 )
+
+type ClickHouseConfig struct {
+	Host     string
+	Port     int
+	Database string
+	Username string
+	Password string
+}
 
 type DeviceTracker struct {
 	ctx           context.Context
@@ -44,10 +55,19 @@ type DeviceTracker struct {
 
 	OutCampaignDevices string
 	OutTargetDevices   string
-	OutTimeFiltered    string
 
 	IdleDeviceBuffer float64
 	NumWorkers       int
+
+	// ClickHouse connection
+	clickhouseConn *sql.DB
+	chMutex        sync.Mutex
+	chBatch        []TimeFilteredRecord
+	targetDates    []TimeFilterPeriod
+
+	// Device ID filter for time filtering
+	deviceIDFilter map[string]struct{}
+	filterMutex    sync.RWMutex
 }
 
 type LocationRecord struct {
@@ -67,11 +87,44 @@ type DeviceRecord struct {
 	Campaign       string
 }
 
-func NewDeviceTracker(locFolder, outputFolder string) *DeviceTracker {
+type TimeFilteredRecord struct {
+	DeviceID       string
+	EventTimestamp time.Time
+	Latitude       float64
+	Longitude      float64
+	LoadDate       time.Time
+}
+
+type TimeFilterPeriod struct {
+	StartTime time.Time
+	EndTime   time.Time
+}
+
+func NewDeviceTracker(locFolder, outputFolder string, chConfig ClickHouseConfig) (*DeviceTracker, error) {
 	numWorkers := runtime.NumCPU()
 	if numWorkers > 16 {
 		numWorkers = 16
 	}
+
+	// Connect to ClickHouse
+	dsn := fmt.Sprintf("clickhouse://%s:%s@%s:%d/%s",
+		chConfig.Username,
+		chConfig.Password,
+		chConfig.Host,
+		chConfig.Port,
+		chConfig.Database,
+	)
+
+	conn, err := sql.Open("clickhouse", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to ClickHouse: %w", err)
+	}
+
+	if err := conn.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping ClickHouse: %w", err)
+	}
+
+	fmt.Println("Successfully connected to ClickHouse")
 
 	return &DeviceTracker{
 		ctx:                context.Background(),
@@ -85,11 +138,156 @@ func NewDeviceTracker(locFolder, outputFolder string) *DeviceTracker {
 		OutputFolder:       outputFolder,
 		OutCampaignDevices: "Devices_Within_Campaign.csv",
 		OutTargetDevices:   "Target_Idle_Devices",
-		OutTimeFiltered:    "Time_Filtered",
 		IdleDeviceBuffer:   10.0,
 		NumWorkers:         numWorkers,
 		spatialIndex:       make(map[int][]int),
+		clickhouseConn:     conn,
+		chBatch:            make([]TimeFilteredRecord, 0, clickhouseBatchSize),
+		deviceIDFilter:     make(map[string]struct{}),
+	}, nil
+}
+
+func (dt *DeviceTracker) Close() error {
+	// Flush any remaining records
+	dt.chMutex.Lock()
+	defer dt.chMutex.Unlock()
+
+	if len(dt.chBatch) > 0 {
+		if err := dt.flushClickHouseBatchUnsafe(); err != nil {
+			fmt.Printf("Error flushing final batch: %v\n", err)
+		}
 	}
+
+	if dt.clickhouseConn != nil {
+		return dt.clickhouseConn.Close()
+	}
+	return nil
+}
+
+func (dt *DeviceTracker) setTargetDates(dates []string) error {
+	dt.targetDates = make([]TimeFilterPeriod, 0, len(dates))
+
+	for _, dateStr := range dates {
+		startTime, err := time.Parse("2006-01-02 15:04:05", dateStr+" "+dt.FilterInTime)
+		if err != nil {
+			return fmt.Errorf("failed to parse start time for %s: %w", dateStr, err)
+		}
+
+		endTime, err := time.Parse("2006-01-02 15:04:05", dateStr+" "+dt.FilterOutTime)
+		if err != nil {
+			return fmt.Errorf("failed to parse end time for %s: %w", dateStr, err)
+		}
+
+		dt.targetDates = append(dt.targetDates, TimeFilterPeriod{
+			StartTime: startTime,
+			EndTime:   endTime,
+		})
+
+		fmt.Printf("Added time filter: %s to %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	}
+
+	return nil
+}
+
+func (dt *DeviceTracker) loadDeviceIDFilter() error {
+	outCSV := filepath.Join(dt.OutputFolder, dt.OutCampaignDevices)
+
+	records, err := dt.readDeviceCSV(outCSV)
+	if err != nil {
+		return fmt.Errorf("failed to read campaign devices: %w", err)
+	}
+
+	dt.filterMutex.Lock()
+	defer dt.filterMutex.Unlock()
+
+	dt.deviceIDFilter = make(map[string]struct{}, len(records))
+	for i := range records {
+		dt.deviceIDFilter[records[i].DeviceID] = struct{}{}
+	}
+
+	fmt.Printf("Loaded %d device IDs for time filtering\n", len(dt.deviceIDFilter))
+	return nil
+}
+
+func (dt *DeviceTracker) isDeviceIDInFilter(deviceID string) bool {
+	dt.filterMutex.RLock()
+	defer dt.filterMutex.RUnlock()
+
+	_, exists := dt.deviceIDFilter[deviceID]
+	return exists
+}
+
+func (dt *DeviceTracker) isWithinTimeFilter(eventTime time.Time) bool {
+	for _, period := range dt.targetDates {
+		if eventTime.After(period.StartTime) && eventTime.Before(period.EndTime) {
+			return true
+		}
+	}
+	return false
+}
+
+func (dt *DeviceTracker) addToClickHouseBatch(record TimeFilteredRecord) error {
+	dt.chMutex.Lock()
+	defer dt.chMutex.Unlock()
+
+	dt.chBatch = append(dt.chBatch, record)
+
+	if len(dt.chBatch) >= clickhouseBatchSize {
+		return dt.flushClickHouseBatchUnsafe()
+	}
+
+	return nil
+}
+
+func (dt *DeviceTracker) flushClickHouseBatchUnsafe() error {
+	if len(dt.chBatch) == 0 {
+		return nil
+	}
+
+	tx, err := dt.clickhouseConn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO time_filtered (
+			device_id, 
+			event_timestamp, 
+			latitude, 
+			longitude, 
+			load_date
+		) VALUES (?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for i := range dt.chBatch {
+		_, err := stmt.Exec(
+			dt.chBatch[i].DeviceID,
+			dt.chBatch[i].EventTimestamp,
+			dt.chBatch[i].Latitude,
+			dt.chBatch[i].Longitude,
+			dt.chBatch[i].LoadDate,
+		)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to execute statement: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	fmt.Printf("Flushed %d records to ClickHouse\n", len(dt.chBatch))
+
+	// Clear the batch
+	dt.chBatch = dt.chBatch[:0]
+
+	return nil
 }
 
 func (dt *DeviceTracker) getSpatialKey(lon, lat float64) int {
@@ -305,14 +503,14 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecor
 	}
 
 	// DEBUG: Print first record from each file
-	if len(records) > 0 {
+	/*if len(records) > 0 {
 		fmt.Printf("DEBUG [%s]: First record - DeviceID=%s, Time=%s, Lat=%.6f, Lon=%.6f\n",
 			filepath.Base(parqFilePath),
 			records[0].DeviceID,
 			records[0].EventTimestamp.Format(time.RFC3339),
 			records[0].Latitude,
 			records[0].Longitude)
-	}
+	}*/
 
 	dateStr := dt.extractDateFromPath(parqFilePath)
 	insertDate, _ := time.Parse("20060102", dateStr)
@@ -343,6 +541,128 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecor
 	}
 
 	return intersectRecords, nil
+}
+
+// Step 3.5: Process time-filtered data and insert to ClickHouse
+func (dt *DeviceTracker) ProcessTimeFilteredData(parquetFolder string) error {
+	fmt.Println("(DT) Started processing time-filtered data")
+	startTime := time.Now()
+
+	// Load device IDs from campaign intersection results
+	if err := dt.loadDeviceIDFilter(); err != nil {
+		return fmt.Errorf("failed to load device ID filter: %w", err)
+	}
+
+	var fileList []string
+	patterns := []string{
+		filepath.Join(parquetFolder, "*.parquet"),
+		filepath.Join(parquetFolder, "*.snappy.parquet"),
+		filepath.Join(parquetFolder, "*.zstd.parquet"),
+		filepath.Join(parquetFolder, "*.gzip.parquet"),
+	}
+
+	for _, pattern := range patterns {
+		files, err := filepath.Glob(pattern)
+		if err == nil && len(files) > 0 {
+			fileList = files
+			break
+		}
+	}
+
+	if len(fileList) == 0 {
+		filepath.Walk(parquetFolder, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".parquet") {
+				fileList = append(fileList, path)
+			}
+			return nil
+		})
+	}
+
+	if len(fileList) == 0 {
+		return fmt.Errorf("no parquet files found in %s", parquetFolder)
+	}
+
+	fmt.Printf("Processing %d files for time filtering\n", len(fileList))
+
+	jobs := make(chan string, len(fileList))
+	var wg sync.WaitGroup
+
+	for w := 0; w < workerPoolSize; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for parqFile := range jobs {
+				if err := dt.processTimeFilteredFile(parqFile); err != nil {
+					fmt.Printf("Error processing %s: %v\n", filepath.Base(parqFile), err)
+				}
+			}
+		}()
+	}
+
+	for i, file := range fileList {
+		if i%100 == 0 {
+			fmt.Printf("Queued for time filtering: %d/%d files\n", i, len(fileList))
+		}
+		jobs <- file
+	}
+	close(jobs)
+
+	wg.Wait()
+
+	// Flush any remaining records
+	dt.chMutex.Lock()
+	if len(dt.chBatch) > 0 {
+		dt.flushClickHouseBatchUnsafe()
+	}
+	dt.chMutex.Unlock()
+
+	fmt.Printf("(DT) Completed time filtering in %v\n", time.Since(startTime))
+	return nil
+}
+
+func (dt *DeviceTracker) processTimeFilteredFile(parqFilePath string) error {
+	records, err := dt.readParquetOptimized(parqFilePath, []string{
+		dt.DeviceIDColumn,
+		dt.TimeColumnName,
+		dt.LatColumn,
+		dt.LonColumn,
+	})
+	if err != nil {
+		return err
+	}
+
+	dateStr := dt.extractDateFromPath(parqFilePath)
+	loadDate, _ := time.Parse("20060102", dateStr)
+
+	for i := range records {
+		// Check if device ID is in the filter
+		if !dt.isDeviceIDInFilter(records[i].DeviceID) {
+			continue
+		}
+
+		// Check if timestamp is within time filter
+		if !dt.isWithinTimeFilter(records[i].EventTimestamp) {
+			continue
+		}
+
+		// Add to ClickHouse batch
+		tfRecord := TimeFilteredRecord{
+			DeviceID:       records[i].DeviceID,
+			EventTimestamp: records[i].EventTimestamp,
+			Latitude:       records[i].Latitude,
+			Longitude:      records[i].Longitude,
+			LoadDate:       loadDate,
+		}
+
+		if err := dt.addToClickHouseBatch(tfRecord); err != nil {
+			return fmt.Errorf("failed to add to ClickHouse batch: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (dt *DeviceTracker) readParquetOptimized(filePath string, columns []string) ([]DeviceRecord, error) {
@@ -495,7 +815,6 @@ func (dt *DeviceTracker) readStringColumn(rg *file.RowGroupReader, colIdx int, n
 				break
 			}
 			for i := 0; i < int(n); i++ {
-				// Check if value is not null
 				if defLevels[i] > 0 {
 					result = append(result, string(values[i]))
 				} else {
@@ -533,9 +852,7 @@ func (dt *DeviceTracker) readTimestampColumn(rg *file.RowGroupReader, colIdx int
 				break
 			}
 			for i := 0; i < int(n); i++ {
-				// Check if value is not null
 				if defLevels[i] > 0 {
-					// Assume microseconds since epoch
 					result = append(result, time.Unix(0, values[i]*1000))
 				} else {
 					result = append(result, time.Time{})
@@ -572,7 +889,6 @@ func (dt *DeviceTracker) readFloatColumn(rg *file.RowGroupReader, colIdx int, nu
 				break
 			}
 			for i := 0; i < int(n); i++ {
-				// Check if value is not null
 				if defLevels[i] > 0 {
 					result = append(result, values[i])
 				} else {
@@ -590,7 +906,6 @@ func (dt *DeviceTracker) readFloatColumn(rg *file.RowGroupReader, colIdx int, nu
 				break
 			}
 			for i := 0; i < int(n); i++ {
-				// Check if value is not null
 				if defLevels[i] > 0 {
 					result = append(result, float64(values[i]))
 				} else {
@@ -603,9 +918,7 @@ func (dt *DeviceTracker) readFloatColumn(rg *file.RowGroupReader, colIdx int, nu
 	return result
 }
 
-// Rest of the code remains the same...
-// [Include all other functions from the previous version: MergeCampaignIntersectionsCSV, FilterTargetTime, RunIdleDeviceSearch, etc.]
-
+// Step 4: Merge campaign intersections - PARALLEL
 func (dt *DeviceTracker) MergeCampaignIntersectionsCSV(folderList []string, folderPrefix string) error {
 	fmt.Println("(DT) Started step 4")
 	startTime := time.Now()
@@ -679,141 +992,14 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsCSV(folderList []string, fold
 	return nil
 }
 
-func (dt *DeviceTracker) FilterTargetTime(dateFolder string, targetDates []string, skipTimezoneError bool) error {
-	fmt.Println("(DT) Started step 5")
-	startTime := time.Now()
-
-	targetFolder := filepath.Join(dt.OutputFolder, filepath.Base(dateFolder))
-	os.MkdirAll(targetFolder, 0755)
-
-	var fileList []string
-	patterns := []string{
-		filepath.Join(dateFolder, "*.parquet"),
-		filepath.Join(dateFolder, "*.snappy.parquet"),
-		filepath.Join(dateFolder, "*.zstd.parquet"),
-		filepath.Join(dateFolder, "*.gzip.parquet"),
-	}
-
-	for _, pattern := range patterns {
-		files, err := filepath.Glob(pattern)
-		if err == nil && len(files) > 0 {
-			fileList = files
-			break
-		}
-	}
-
-	if len(fileList) == 0 {
-		filepath.Walk(dateFolder, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".parquet") {
-				fileList = append(fileList, path)
-			}
-			return nil
-		})
-	}
-
-	idList, err := dt.getUniqueIDList()
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Devices to match: %d, Files: %d\n", len(idList), len(fileList))
-
-	if len(fileList) == 0 {
-		fmt.Printf("WARNING: No parquet files found in %s\n", dateFolder)
-		return nil
-	}
-
-	idSet := make(map[string]struct{}, len(idList))
-	for _, id := range idList {
-		idSet[id] = struct{}{}
-	}
-
-	for _, targetDate := range targetDates {
-		outCSV := filepath.Join(targetFolder, fmt.Sprintf("%s_%s.csv", dt.OutTimeFiltered, targetDate))
-		os.Remove(outCSV)
-
-		startTimeFilter, _ := time.Parse("2006-01-02 15:04:05", targetDate+" "+dt.FilterInTime)
-		endTimeFilter, _ := time.Parse("2006-01-02 15:04:05", targetDate+" "+dt.FilterOutTime)
-
-		jobs := make(chan string, len(fileList))
-		results := make(chan []DeviceRecord, workerPoolSize)
-		var wg sync.WaitGroup
-
-		for w := 0; w < workerPoolSize; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for parqFile := range jobs {
-					records, err := dt.readParquetOptimized(parqFile, nil)
-					if err != nil {
-						if !skipTimezoneError {
-							fmt.Printf("Error: %v\n", err)
-						}
-						continue
-					}
-
-					filtered := make([]DeviceRecord, 0)
-					for i := range records {
-						if _, exists := idSet[records[i].DeviceID]; exists {
-							if records[i].EventTimestamp.After(startTimeFilter) && records[i].EventTimestamp.Before(endTimeFilter) {
-								filtered = append(filtered, records[i])
-							}
-						}
-					}
-
-					if len(filtered) > 0 {
-						results <- filtered
-					}
-				}
-			}()
-		}
-
-		var allFiltered []DeviceRecord
-		var mu sync.Mutex
-		var collectorWg sync.WaitGroup
-		collectorWg.Add(1)
-		go func() {
-			defer collectorWg.Done()
-			for filtered := range results {
-				mu.Lock()
-				allFiltered = append(allFiltered, filtered...)
-				mu.Unlock()
-			}
-		}()
-
-		for _, file := range fileList {
-			jobs <- file
-		}
-		close(jobs)
-
-		wg.Wait()
-		close(results)
-		collectorWg.Wait()
-
-		allFiltered = dt.deduplicateRecords(allFiltered)
-		fmt.Printf("Date %s: %d records\n", targetDate, len(allFiltered))
-
-		dt.writeDeviceCSVOptimized(outCSV, allFiltered)
-	}
-
-	fmt.Printf("(DT) Completed step 5 in %v\n", time.Since(startTime))
-	return nil
-}
-
-// Include all remaining functions from document 4...
-// (RunIdleDeviceSearch, PrepareLocationDataFrame, parseWKTPolygon, etc.)
-// Copy them exactly as they are in document 4
-
-func (dt *DeviceTracker) RunIdleDeviceSearch(folderList, targetDates []string) error {
+// Step 6: Idle device search - PARALLEL (reads from ClickHouse)
+func (dt *DeviceTracker) RunIdleDeviceSearch(targetDates []string) error {
 	fmt.Println("(DT) Started step 6")
 	startTime := time.Now()
 
 	for _, date := range targetDates {
 		fmt.Printf("Processing date: %s\n", date)
-		err := dt.findIdleDevicesOptimized(folderList, date)
+		err := dt.findIdleDevicesFromClickHouse(date)
 		if err != nil {
 			fmt.Printf("Error for %s: %v\n", date, err)
 		}
@@ -828,7 +1014,8 @@ func (dt *DeviceTracker) RunIdleDeviceSearch(folderList, targetDates []string) e
 	return nil
 }
 
-func (dt *DeviceTracker) findIdleDevicesOptimized(folderList []string, targetDate string) error {
+func (dt *DeviceTracker) findIdleDevicesFromClickHouse(targetDate string) error {
+	// Load unique device data from campaign CSV
 	uIdDataFrame, err := dt.getUniqIdDataFrame()
 	if err != nil {
 		return err
@@ -839,52 +1026,44 @@ func (dt *DeviceTracker) findIdleDevicesOptimized(folderList []string, targetDat
 		uniqDeviceMap[uIdDataFrame[i].DeviceID] = uIdDataFrame[i]
 	}
 
-	type fileResult struct {
-		records []DeviceRecord
+	// Query ClickHouse for time-filtered data for this date
+	parseDate, _ := time.Parse("2006-01-02", targetDate)
+
+	query := `
+		SELECT device_id, event_timestamp, latitude, longitude
+		FROM time_filtered
+		WHERE toDate(load_date) = ?
+		ORDER BY device_id, event_timestamp
+	`
+
+	rows, err := dt.clickhouseConn.Query(query, parseDate)
+	if err != nil {
+		return fmt.Errorf("failed to query ClickHouse: %w", err)
+	}
+	defer rows.Close()
+
+	// Read all records and group by device_id
+	deviceGroups := make(map[string][]DeviceRecord)
+
+	for rows.Next() {
+		var rec DeviceRecord
+		if err := rows.Scan(&rec.DeviceID, &rec.EventTimestamp, &rec.Latitude, &rec.Longitude); err != nil {
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+		deviceGroups[rec.DeviceID] = append(deviceGroups[rec.DeviceID], rec)
 	}
 
-	results := make(chan fileResult, len(folderList))
-	var wg sync.WaitGroup
-
-	for _, folderName := range folderList {
-		wg.Add(1)
-		go func(fname string) {
-			defer wg.Done()
-
-			csvPath := filepath.Join(dt.OutputFolder, fname, fmt.Sprintf("%s_%s.csv", dt.OutTimeFiltered, targetDate))
-			if _, err := os.Stat(csvPath); os.IsNotExist(err) {
-				return
-			}
-
-			records, err := dt.readDeviceCSV(csvPath)
-			if err != nil {
-				return
-			}
-
-			results <- fileResult{records}
-		}(folderName)
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating rows: %w", err)
 	}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+	fmt.Printf("Loaded %d devices from ClickHouse for date %s\n", len(deviceGroups), targetDate)
 
-	var allRecords []DeviceRecord
-	for res := range results {
-		allRecords = append(allRecords, res.records...)
-	}
-
-	if len(allRecords) == 0 {
+	if len(deviceGroups) == 0 {
 		return nil
 	}
 
-	deviceGroups := make(map[string][]DeviceRecord)
-	for i := range allRecords {
-		id := allRecords[i].DeviceID
-		deviceGroups[id] = append(deviceGroups[id], allRecords[i])
-	}
-
+	// Process devices in parallel to find idle ones
 	deviceIDs := make([]string, 0, len(deviceGroups))
 	for id := range deviceGroups {
 		deviceIDs = append(deviceIDs, id)
@@ -1113,7 +1292,6 @@ func (dt *DeviceTracker) readDeviceCSV(filePath string) ([]DeviceRecord, error) 
 
 		timestamp, _ := time.Parse(time.RFC3339, rows[i][1])
 
-		// Parse geometry to extract lat/lon
 		geometry := rows[i][2]
 		lat, lon := dt.parsePointGeometry(geometry)
 
@@ -1132,7 +1310,6 @@ func (dt *DeviceTracker) readDeviceCSV(filePath string) ([]DeviceRecord, error) 
 }
 
 func (dt *DeviceTracker) parsePointGeometry(geometry string) (float64, float64) {
-	// Parse "POINT (lon lat)" format
 	geometry = strings.TrimPrefix(geometry, "POINT (")
 	geometry = strings.TrimSuffix(geometry, ")")
 	parts := strings.Fields(geometry)
@@ -1303,10 +1480,28 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	fmt.Printf("Folder List: %v\n", folderList)
 	fmt.Printf("CPU Cores: %d\n", runtime.NumCPU())
 
-	dt := NewDeviceTracker(
+	chConfig := ClickHouseConfig{
+		Host:     "172.173.97.164",
+		Port:     9000,
+		Database: "device_tracking",
+		Username: "default",
+		Password: "nyros",
+	}
+
+	dt, err := NewDeviceTracker(
 		"/home/device-tracker/data/geocoded",
 		"/home/device-tracker/data/output",
+		chConfig,
 	)
+	if err != nil {
+		return fmt.Errorf("failed to create device tracker: %w", err)
+	}
+	defer dt.Close()
+
+	// Set target dates for time filtering
+	if err := dt.setTargetDates(dates); err != nil {
+		return fmt.Errorf("failed to set target dates: %w", err)
+	}
 
 	if containsStep(runSteps, 3) {
 		fmt.Println("\n========== Running STEP 3 ==========")
@@ -1336,15 +1531,21 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 		fmt.Println("Step 4 Completed")
 	}
 
+	// New Step 3.5: Process time-filtered data and insert to ClickHouse
 	if containsStep(runSteps, 5) {
-		fmt.Println("\n========== Running STEP 5 ==========")
-		dt.FilterInTime = "02:00:00"
-		dt.FilterOutTime = "04:30:00"
-
-		for _, folder := range folderList {
-			err := dt.FilterTargetTime("/mnt/blobcontainer/"+folder, dates, skipTimezoneError)
+		fmt.Println("\n========== Running STEP 5 (Time Filtering to ClickHouse) ==========")
+		if runForPastDays {
+			for _, folder := range folderList {
+				err := dt.ProcessTimeFilteredData("/mnt/blobcontainer/" + folder)
+				if err != nil {
+					fmt.Printf("Error in step 5 for %s: %v\n", folder, err)
+				}
+			}
+		} else {
+			todayFolder := "load_date=" + today.Format("20060102")
+			err := dt.ProcessTimeFilteredData("/mnt/blobcontainer/" + todayFolder)
 			if err != nil {
-				fmt.Printf("Error in step 5 for %s: %v\n", folder, err)
+				fmt.Printf("Error in step 5: %v\n", err)
 			}
 		}
 		fmt.Println("Step 5 Completed")
@@ -1352,7 +1553,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 
 	if containsStep(runSteps, 6) {
 		fmt.Println("\n========== Running STEP 6 ==========")
-		err := dt.RunIdleDeviceSearch(folderList, dates)
+		err := dt.RunIdleDeviceSearch(dates)
 		if err != nil {
 			fmt.Printf("Error in step 6: %v\n", err)
 			return err
