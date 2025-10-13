@@ -146,9 +146,62 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string)
 	// Build spatial index for faster lookups
 	dt.buildSpatialIndex()
 
-	fileList, err := filepath.Glob(filepath.Join(parquetFolder, "*.parquet"))
-	if err != nil {
-		return err
+	// Try multiple patterns to find parquet files
+	var fileList []string
+	var err error
+
+	patterns := []string{
+		filepath.Join(parquetFolder, "*.parquet"),
+		filepath.Join(parquetFolder, "*.snappy.parquet"),
+		filepath.Join(parquetFolder, "*.zstd.parquet"),
+		filepath.Join(parquetFolder, "*.gzip.parquet"),
+		filepath.Join(parquetFolder, "part-*.parquet"),
+	}
+
+	for _, pattern := range patterns {
+		files, err := filepath.Glob(pattern)
+		if err == nil && len(files) > 0 {
+			fileList = files
+			break
+		}
+	}
+
+	// If still no files found, try recursive search
+	if len(fileList) == 0 {
+		fmt.Printf("No parquet files found with standard patterns, searching recursively in: %s\n", parquetFolder)
+		err = filepath.Walk(parquetFolder, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil // Skip errors
+			}
+			if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".parquet") {
+				fileList = append(fileList, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(fileList) == 0 {
+		// List what's actually in the directory
+		fmt.Printf("DEBUG: Listing contents of %s\n", parquetFolder)
+		entries, err := os.ReadDir(parquetFolder)
+		if err != nil {
+			return fmt.Errorf("cannot read directory %s: %w", parquetFolder, err)
+		}
+
+		fmt.Printf("Found %d items in directory:\n", len(entries))
+		for i, entry := range entries {
+			if i < 20 { // Show first 20 items
+				fmt.Printf("  - %s (isDir: %v)\n", entry.Name(), entry.IsDir())
+			}
+		}
+		if len(entries) > 20 {
+			fmt.Printf("  ... and %d more items\n", len(entries)-20)
+		}
+
+		return fmt.Errorf("no parquet files found in %s", parquetFolder)
 	}
 
 	fmt.Printf("Total Files: %d\n", len(fileList))
@@ -623,9 +676,34 @@ func (dt *DeviceTracker) FilterTargetTime(dateFolder string, targetDates []strin
 	targetFolder := filepath.Join(dt.OutputFolder, filepath.Base(dateFolder))
 	os.MkdirAll(targetFolder, 0755)
 
-	fileList, err := filepath.Glob(filepath.Join(dateFolder, "*.parquet"))
-	if err != nil {
-		return err
+	// Try multiple patterns to find parquet files
+	var fileList []string
+	patterns := []string{
+		filepath.Join(dateFolder, "*.parquet"),
+		filepath.Join(dateFolder, "*.snappy.parquet"),
+		filepath.Join(dateFolder, "*.zstd.parquet"),
+		filepath.Join(dateFolder, "*.gzip.parquet"),
+	}
+
+	for _, pattern := range patterns {
+		files, err := filepath.Glob(pattern)
+		if err == nil && len(files) > 0 {
+			fileList = files
+			break
+		}
+	}
+
+	// If still no files, try recursive search
+	if len(fileList) == 0 {
+		filepath.Walk(dateFolder, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".parquet") {
+				fileList = append(fileList, path)
+			}
+			return nil
+		})
 	}
 
 	idList, err := dt.getUniqueIDList()
@@ -634,6 +712,11 @@ func (dt *DeviceTracker) FilterTargetTime(dateFolder string, targetDates []strin
 	}
 
 	fmt.Printf("Devices to match: %d, Files: %d\n", len(idList), len(fileList))
+
+	if len(fileList) == 0 {
+		fmt.Printf("WARNING: No parquet files found in %s\n", dateFolder)
+		return nil
+	}
 
 	idSet := make(map[string]struct{}, len(idList))
 	for _, id := range idList {
