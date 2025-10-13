@@ -210,7 +210,7 @@ func (dt *DeviceTracker) flushClickHouseBatchUnsafe() error {
 	return nil
 }
 
-func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecord, error) {
+func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, step5 bool) ([]DeviceRecord, error) {
 	records, err := dt.readParquetOptimized(parqFilePath)
 	if err != nil {
 		return nil, err
@@ -229,35 +229,39 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecor
 	for i := range records {
 		records[i].InsertDate = insertDate
 
-		// Check time filter using the timezone-aware timestamp
-		if dt.isWithinTimeFilter(records[i].EventTimestamp) {
-			tfRecord := TimeFilteredRecord{
-				DeviceID:       records[i].DeviceID,
-				EventTimestamp: records[i].EventTimestamp, // Preserve original timezone
-				Latitude:       records[i].Latitude,
-				Longitude:      records[i].Longitude,
-				LoadDate:       loadDate,
-			}
+		if step5 {
+			// Check time filter using the timezone-aware timestamp
+			if dt.isWithinTimeFilter(records[i].EventTimestamp) {
+				tfRecord := TimeFilteredRecord{
+					DeviceID:       records[i].DeviceID,
+					EventTimestamp: records[i].EventTimestamp, // Preserve original timezone
+					Latitude:       records[i].Latitude,
+					Longitude:      records[i].Longitude,
+					LoadDate:       loadDate,
+				}
 
-			if err := dt.addToClickHouseBatch(tfRecord); err != nil {
-				fmt.Printf("Error adding to ClickHouse batch: %v\n", err)
+				if err := dt.addToClickHouseBatch(tfRecord); err != nil {
+					fmt.Printf("Error adding to ClickHouse batch: %v\n", err)
+				}
 			}
 		}
 
-		point := orb.Point{records[i].Longitude, records[i].Latitude}
+		if step3 {
+			point := orb.Point{records[i].Longitude, records[i].Latitude}
 
-		candidates := dt.findIntersectingPolygons(records[i].Longitude, records[i].Latitude)
+			candidates := dt.findIntersectingPolygons(records[i].Longitude, records[i].Latitude)
 
-		for _, idx := range candidates {
-			if !dt.LocData[idx].Bounds.Contains(point) {
-				continue
-			}
+			for _, idx := range candidates {
+				if !dt.LocData[idx].Bounds.Contains(point) {
+					continue
+				}
 
-			if planar.PolygonContains(dt.LocData[idx].Geometry, point) {
-				records[i].Address = dt.LocData[idx].Address
-				records[i].Campaign = dt.LocData[idx].Campaign
-				intersectRecords = append(intersectRecords, records[i])
-				break
+				if planar.PolygonContains(dt.LocData[idx].Geometry, point) {
+					records[i].Address = dt.LocData[idx].Address
+					records[i].Campaign = dt.LocData[idx].Campaign
+					intersectRecords = append(intersectRecords, records[i])
+					break
+				}
 			}
 		}
 	}
@@ -437,7 +441,7 @@ func (dt *DeviceTracker) findIntersectingPolygons(lon, lat float64) []int {
 	return dt.spatialIndex[key]
 }
 
-func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string) error {
+func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string, step3 bool, step5 bool) error {
 	fmt.Println("(DT) Started step 3")
 	startTime := time.Now()
 
@@ -519,7 +523,7 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string)
 		go func() {
 			defer wg.Done()
 			for parqFile := range jobs {
-				records, err := dt.processCampaignFile(parqFile)
+				records, err := dt.processCampaignFile(parqFile, step3, step5)
 				if err != nil {
 					fmt.Printf("Error processing %s: %v\n", filepath.Base(parqFile), err)
 					continue
@@ -1331,8 +1335,6 @@ func (dt *DeviceTracker) getUniqIdDataFrame() ([]DeviceRecord, error) {
 func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	today := time.Now()
-
 	dates := []string{
 		"2025-10-03",
 	}
@@ -1364,20 +1366,15 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	}
 	defer dt.Close()
 
-	if containsStep(runSteps, 3) {
+	step3 := containsStep(runSteps, 3)
+	step5 := containsStep(runSteps, 5)
+
+	if step3 || step5 {
 		fmt.Println("\n========== Running STEP 3 ==========")
-		if runForPastDays {
-			for _, folder := range folderList {
-				err := dt.FindCampaignIntersectionForFolder("/mnt/blobcontainer/" + folder)
-				if err != nil {
-					fmt.Printf("Error in step 3 for %s: %v\n", folder, err)
-				}
-			}
-		} else {
-			todayFolder := "load_date=" + today.Format("20060102")
-			err := dt.FindCampaignIntersectionForFolder("/mnt/blobcontainer/" + todayFolder)
+		for _, folder := range folderList {
+			err := dt.FindCampaignIntersectionForFolder("/mnt/blobcontainer/"+folder, step3, step5)
 			if err != nil {
-				fmt.Printf("Error in step 3: %v\n", err)
+				fmt.Printf("Error in step 3 for %s: %v\n", folder, err)
 			}
 		}
 		fmt.Println("Step 3 Completed")
@@ -1421,7 +1418,7 @@ func main() {
 
 	startTime := time.Now()
 
-	runSteps := []int{3, 4, 6}
+	runSteps := []int{5} //[]int{3, 4, 6}
 
 	err := RunDeviceTracker(true, true, runSteps)
 	if err != nil {
