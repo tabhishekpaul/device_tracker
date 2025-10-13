@@ -1033,7 +1033,7 @@ func main() {
 
 	startTime := time.Now()
 
-	runSteps := []int{6}
+	runSteps := []int{3, 4, 5, 6}
 
 	err := RunDeviceTracker(true, false, runSteps)
 	if err != nil {
