@@ -1342,13 +1342,13 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	dates := []string{
-		"2025-10-04",
-		"2025-10-05",
 		"2025-10-06",
 		"2025-10-07",
 		"2025-10-08",
 		"2025-10-09",
 		"2025-10-10",
+		"2025-10-11",
+		"2025-10-12",
 	}
 
 	folderList := make([]string, 0, len(dates))
