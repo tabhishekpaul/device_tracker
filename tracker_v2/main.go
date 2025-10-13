@@ -526,6 +526,7 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecor
 		records[i].InsertDate = insertDate
 
 		if dt.isWithinTimeFilter(records[i].EventTimestamp) {
+			fmt.Println("Record within time filter:", records[i].DeviceID, records[i].EventTimestamp)
 			tfRecord := TimeFilteredRecord{
 				DeviceID:       records[i].DeviceID,
 				EventTimestamp: records[i].EventTimestamp,
