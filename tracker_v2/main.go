@@ -105,6 +105,166 @@ type TimeFilterPeriod struct {
 	EndTime   time.Time
 }
 
+func (dt *DeviceTracker) readTimestampColumn(rg *file.RowGroupReader, colIdx int, numRows int) []time.Time {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Panic reading timestamp column: %v\n", r)
+		}
+	}()
+
+	col, err := rg.Column(colIdx)
+	if err != nil {
+		return make([]time.Time, 0)
+	}
+
+	result := make([]time.Time, 0, numRows)
+
+	switch reader := col.(type) {
+	case *file.Int64ColumnChunkReader:
+		values := make([]int64, 8192)
+		defLevels := make([]int16, 8192)
+
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
+			if n == 0 {
+				break
+			}
+			for i := 0; i < int(n); i++ {
+				if defLevels[i] > 0 {
+					// Convert from microseconds to time.Time in UTC
+					t := time.Unix(0, values[i]*1000).UTC()
+					result = append(result, t)
+				} else {
+					result = append(result, time.Time{})
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+func (dt *DeviceTracker) isWithinTimeFilter(eventTime time.Time) bool {
+	// Work with local time components
+	hour := eventTime.Hour()
+	min := eventTime.Minute()
+	sec := eventTime.Second()
+
+	eventSeconds := hour*3600 + min*60 + sec
+
+	if dt.startSeconds < dt.endSeconds {
+		return eventSeconds >= dt.startSeconds && eventSeconds < dt.endSeconds
+	}
+
+	return eventSeconds >= dt.startSeconds || eventSeconds < dt.endSeconds
+}
+
+func (dt *DeviceTracker) flushClickHouseBatchUnsafe() error {
+	if len(dt.chBatch) == 0 {
+		return nil
+	}
+
+	tx, err := dt.clickhouseConn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO time_filtered (
+			device_id, 
+			event_timestamp, 
+			latitude, 
+			longitude, 
+			load_date
+		) VALUES (?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for i := range dt.chBatch {
+		// Store timestamp as-is (with timezone info preserved)
+		_, err := stmt.Exec(
+			dt.chBatch[i].DeviceID,
+			dt.chBatch[i].EventTimestamp,
+			dt.chBatch[i].Latitude,
+			dt.chBatch[i].Longitude,
+			dt.chBatch[i].LoadDate,
+		)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to execute statement: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	fmt.Printf("Flushed %d records to ClickHouse\n", len(dt.chBatch))
+
+	dt.chBatch = dt.chBatch[:0]
+
+	return nil
+}
+
+func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecord, error) {
+	records, err := dt.readParquetOptimized(parqFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	dateStr := dt.extractDateFromPath(parqFilePath)
+	insertDate, _ := time.Parse("20060102", dateStr)
+	// Parse load_date as UTC midnight for that date
+	loadDate := time.Date(insertDate.Year(), insertDate.Month(), insertDate.Day(), 0, 0, 0, 0, time.UTC)
+
+	intersectRecords := make([]DeviceRecord, 0, len(records)/10)
+
+	dt.LocDataMutex.RLock()
+	defer dt.LocDataMutex.RUnlock()
+
+	for i := range records {
+		records[i].InsertDate = insertDate
+
+		// Check time filter using the timezone-aware timestamp
+		if dt.isWithinTimeFilter(records[i].EventTimestamp) {
+			tfRecord := TimeFilteredRecord{
+				DeviceID:       records[i].DeviceID,
+				EventTimestamp: records[i].EventTimestamp, // Preserve original timezone
+				Latitude:       records[i].Latitude,
+				Longitude:      records[i].Longitude,
+				LoadDate:       loadDate,
+			}
+
+			if err := dt.addToClickHouseBatch(tfRecord); err != nil {
+				fmt.Printf("Error adding to ClickHouse batch: %v\n", err)
+			}
+		}
+
+		point := orb.Point{records[i].Longitude, records[i].Latitude}
+
+		candidates := dt.findIntersectingPolygons(records[i].Longitude, records[i].Latitude)
+
+		for _, idx := range candidates {
+			if !dt.LocData[idx].Bounds.Contains(point) {
+				continue
+			}
+
+			if planar.PolygonContains(dt.LocData[idx].Geometry, point) {
+				records[i].Address = dt.LocData[idx].Address
+				records[i].Campaign = dt.LocData[idx].Campaign
+				intersectRecords = append(intersectRecords, records[i])
+				break
+			}
+		}
+	}
+
+	return intersectRecords, nil
+}
+
 func NewDeviceTracker(locFolder, outputFolder string, chConfig ClickHouseConfig) (*DeviceTracker, error) {
 	numWorkers := runtime.NumCPU()
 	if numWorkers > 16 {
@@ -229,20 +389,6 @@ func (dt *DeviceTracker) Close() error {
 	return nil
 }
 
-func (dt *DeviceTracker) isWithinTimeFilter(eventTime time.Time) bool {
-	hour := eventTime.Hour()
-	min := eventTime.Minute()
-	sec := eventTime.Second()
-
-	eventSeconds := hour*3600 + min*60 + sec
-
-	if dt.startSeconds < dt.endSeconds {
-		return eventSeconds >= dt.startSeconds && eventSeconds < dt.endSeconds
-	}
-
-	return eventSeconds >= dt.startSeconds || eventSeconds < dt.endSeconds
-}
-
 func (dt *DeviceTracker) addToClickHouseBatch(record TimeFilteredRecord) error {
 	dt.chMutex.Lock()
 	defer dt.chMutex.Unlock()
@@ -252,56 +398,6 @@ func (dt *DeviceTracker) addToClickHouseBatch(record TimeFilteredRecord) error {
 	if len(dt.chBatch) >= clickhouseBatchSize {
 		return dt.flushClickHouseBatchUnsafe()
 	}
-
-	return nil
-}
-
-func (dt *DeviceTracker) flushClickHouseBatchUnsafe() error {
-	if len(dt.chBatch) == 0 {
-		return nil
-	}
-
-	tx, err := dt.clickhouseConn.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-
-	stmt, err := tx.Prepare(`
-		INSERT INTO time_filtered (
-			device_id, 
-			event_timestamp, 
-			latitude, 
-			longitude, 
-			load_date
-		) VALUES (?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to prepare statement: %w", err)
-	}
-	defer stmt.Close()
-
-	for i := range dt.chBatch {
-		_, err := stmt.Exec(
-			dt.chBatch[i].DeviceID,
-			dt.chBatch[i].EventTimestamp,
-			dt.chBatch[i].Latitude,
-			dt.chBatch[i].Longitude,
-			dt.chBatch[i].LoadDate,
-		)
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to execute statement: %w", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	fmt.Printf("Flushed %d records to ClickHouse\n", len(dt.chBatch))
-
-	dt.chBatch = dt.chBatch[:0]
 
 	return nil
 }
@@ -507,62 +603,6 @@ func (dt *DeviceTracker) batchWriteCSV(csvPath string, results <-chan []DeviceRe
 	fmt.Printf("Total records written: %d\n", totalRecords)
 }
 
-func (dt *DeviceTracker) processCampaignFile(parqFilePath string) ([]DeviceRecord, error) {
-	records, err := dt.readParquetOptimized(parqFilePath)
-	if err != nil {
-		return nil, err
-	}
-
-	dateStr := dt.extractDateFromPath(parqFilePath)
-	insertDate, _ := time.Parse("20060102", dateStr)
-	loadDate, _ := time.Parse("20060102", dateStr)
-
-	intersectRecords := make([]DeviceRecord, 0, len(records)/10)
-
-	dt.LocDataMutex.RLock()
-	defer dt.LocDataMutex.RUnlock()
-
-	for i := range records {
-		records[i].InsertDate = insertDate
-
-		if dt.isWithinTimeFilter(records[i].EventTimestamp) {
-			fmt.Println("Record within time filter:", records[i].DeviceID, records[i].EventTimestamp)
-			tfRecord := TimeFilteredRecord{
-				DeviceID:       records[i].DeviceID,
-				EventTimestamp: records[i].EventTimestamp,
-				Latitude:       records[i].Latitude,
-				Longitude:      records[i].Longitude,
-				LoadDate:       loadDate,
-			}
-
-			if err := dt.addToClickHouseBatch(tfRecord); err != nil {
-				fmt.Printf("Error adding to ClickHouse batch: %v\n", err)
-			}
-		}
-
-		point := orb.Point{records[i].Longitude, records[i].Latitude}
-
-		candidates := dt.findIntersectingPolygons(records[i].Longitude, records[i].Latitude)
-
-		for _, idx := range candidates {
-
-			if !dt.LocData[idx].Bounds.Contains(point) {
-				continue
-			}
-
-			if planar.PolygonContains(dt.LocData[idx].Geometry, point) {
-				records[i].Address = dt.LocData[idx].Address
-				records[i].Campaign = dt.LocData[idx].Campaign
-				intersectRecords = append(intersectRecords, records[i])
-
-				break
-			}
-		}
-	}
-
-	return intersectRecords, nil
-}
-
 func (dt *DeviceTracker) readParquetOptimized(filePath string) ([]DeviceRecord, error) {
 	pf, err := file.OpenParquetFile(filePath, false)
 	if err != nil {
@@ -717,43 +757,6 @@ func (dt *DeviceTracker) readStringColumn(rg *file.RowGroupReader, colIdx int, n
 					result = append(result, string(values[i]))
 				} else {
 					result = append(result, "")
-				}
-			}
-		}
-	}
-
-	return result
-}
-
-func (dt *DeviceTracker) readTimestampColumn(rg *file.RowGroupReader, colIdx int, numRows int) []time.Time {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("Panic reading timestamp column: %v\n", r)
-		}
-	}()
-
-	col, err := rg.Column(colIdx)
-	if err != nil {
-		return make([]time.Time, 0)
-	}
-
-	result := make([]time.Time, 0, numRows)
-
-	switch reader := col.(type) {
-	case *file.Int64ColumnChunkReader:
-		values := make([]int64, 8192)
-		defLevels := make([]int16, 8192)
-
-		for {
-			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
-			if n == 0 {
-				break
-			}
-			for i := 0; i < int(n); i++ {
-				if defLevels[i] > 0 {
-					result = append(result, time.Unix(0, values[i]*1000))
-				} else {
-					result = append(result, time.Time{})
 				}
 			}
 		}
