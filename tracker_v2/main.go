@@ -279,6 +279,11 @@ func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceReco
 	schema := table.Schema()
 	numRows := int(table.NumRows())
 
+	// Return early if no rows
+	if numRows == 0 {
+		return nil
+	}
+
 	deviceIDIdx := schema.FieldIndices(dt.DeviceIDColumn)
 	timeIdx := schema.FieldIndices(dt.TimeColumnName)
 	latIdx := schema.FieldIndices(dt.LatColumn)
@@ -295,13 +300,40 @@ func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceReco
 	latCol := table.Column(latIdx[0]).Data()
 	lonCol := table.Column(lonIdx[0]).Data()
 
-	for chunkIdx := 0; chunkIdx < deviceIDCol.Len(); chunkIdx++ {
+	// Find minimum chunk count across all columns
+	minChunks := deviceIDCol.Len()
+	if timeCol.Len() < minChunks {
+		minChunks = timeCol.Len()
+	}
+	if latCol.Len() < minChunks {
+		minChunks = latCol.Len()
+	}
+	if lonCol.Len() < minChunks {
+		minChunks = lonCol.Len()
+	}
+
+	// Return early if no chunks
+	if minChunks == 0 {
+		return nil
+	}
+
+	for chunkIdx := 0; chunkIdx < minChunks; chunkIdx++ {
 		deviceChunk := deviceIDCol.Chunk(chunkIdx)
 		timeChunk := timeCol.Chunk(chunkIdx)
 		latChunk := latCol.Chunk(chunkIdx)
 		lonChunk := lonCol.Chunk(chunkIdx)
 
+		// Find minimum length across all chunks
 		chunkLen := deviceChunk.Len()
+		if timeChunk.Len() < chunkLen {
+			chunkLen = timeChunk.Len()
+		}
+		if latChunk.Len() < chunkLen {
+			chunkLen = latChunk.Len()
+		}
+		if lonChunk.Len() < chunkLen {
+			chunkLen = lonChunk.Len()
+		}
 
 		for i := 0; i < chunkLen; i++ {
 			if deviceChunk.IsNull(i) || timeChunk.IsNull(i) || latChunk.IsNull(i) || lonChunk.IsNull(i) {
