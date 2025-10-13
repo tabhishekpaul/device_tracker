@@ -47,6 +47,9 @@ type DeviceTracker struct {
 	filterEndMin    int
 	filterEndSec    int
 
+	startSeconds int
+	endSeconds   int
+
 	TimeColumnName string
 	DeviceIDColumn string
 	LatColumn      string
@@ -199,6 +202,9 @@ func (dt *DeviceTracker) parseFilterTimes() error {
 		return fmt.Errorf("invalid end second: %w", err)
 	}
 
+	dt.startSeconds = dt.filterStartHour*3600 + dt.filterStartMin*60 + dt.filterStartSec
+	dt.endSeconds = dt.filterEndHour*3600 + dt.filterEndMin*60 + dt.filterEndSec
+
 	fmt.Printf("Time filter configured: %02d:%02d:%02d to %02d:%02d:%02d\n",
 		dt.filterStartHour, dt.filterStartMin, dt.filterStartSec,
 		dt.filterEndHour, dt.filterEndMin, dt.filterEndSec)
@@ -228,19 +234,13 @@ func (dt *DeviceTracker) isWithinTimeFilter(eventTime time.Time) bool {
 	min := eventTime.Minute()
 	sec := eventTime.Second()
 
-	// Convert to total seconds for easy comparison
 	eventSeconds := hour*3600 + min*60 + sec
-	startSeconds := dt.filterStartHour*3600 + dt.filterStartMin*60 + dt.filterStartSec
-	endSeconds := dt.filterEndHour*3600 + dt.filterEndMin*60 + dt.filterEndSec
 
-	// Simple case: start < end (e.g., 02:00:00 to 04:30:00)
-	if startSeconds < endSeconds {
-		return eventSeconds >= startSeconds && eventSeconds < endSeconds
+	if dt.startSeconds < dt.endSeconds {
+		return eventSeconds >= dt.startSeconds && eventSeconds < dt.endSeconds
 	}
 
-	// Cross-midnight case: start > end (e.g., 22:00:00 to 02:00:00)
-	// Event is valid if it's after start OR before end
-	return eventSeconds >= startSeconds || eventSeconds < endSeconds
+	return eventSeconds >= dt.startSeconds || eventSeconds < dt.endSeconds
 }
 
 func (dt *DeviceTracker) addToClickHouseBatch(record TimeFilteredRecord) error {
