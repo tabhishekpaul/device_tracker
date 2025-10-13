@@ -157,12 +157,20 @@ func (dt *DeviceTracker) campaignWorker(wg *sync.WaitGroup, jobs <-chan string, 
 	defer wg.Done()
 
 	for parqFile := range jobs {
-		records, err := dt.processCampaignFile(parqFile)
-		if err != nil {
-			fmt.Printf("Error processing %s: %v\n", filepath.Base(parqFile), err)
-		} else if len(records) > 0 {
-			results <- records
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("Panic processing %s: %v\n", filepath.Base(parqFile), r)
+				}
+			}()
+
+			records, err := dt.processCampaignFile(parqFile)
+			if err != nil {
+				fmt.Printf("Error processing %s: %v\n", filepath.Base(parqFile), err)
+			} else if len(records) > 0 {
+				results <- records
+			}
+		}()
 	}
 }
 
@@ -295,21 +303,36 @@ func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceReco
 
 	records := make([]DeviceRecord, 0, numRows)
 
-	deviceIDCol := table.Column(deviceIDIdx[0]).Data()
-	timeCol := table.Column(timeIdx[0]).Data()
-	latCol := table.Column(latIdx[0]).Data()
-	lonCol := table.Column(lonIdx[0]).Data()
+	deviceIDCol := table.Column(deviceIDIdx[0])
+	timeCol := table.Column(timeIdx[0])
+	latCol := table.Column(latIdx[0])
+	lonCol := table.Column(lonIdx[0])
+
+	// Safety check: ensure columns exist
+	if deviceIDCol == nil || timeCol == nil || latCol == nil || lonCol == nil {
+		return nil
+	}
+
+	deviceIDData := deviceIDCol.Data()
+	timeData := timeCol.Data()
+	latData := latCol.Data()
+	lonData := lonCol.Data()
+
+	// Safety check: ensure data chunks exist
+	if deviceIDData == nil || timeData == nil || latData == nil || lonData == nil {
+		return nil
+	}
 
 	// Find minimum chunk count across all columns
-	minChunks := deviceIDCol.Len()
-	if timeCol.Len() < minChunks {
-		minChunks = timeCol.Len()
+	minChunks := deviceIDData.Len()
+	if timeData.Len() < minChunks {
+		minChunks = timeData.Len()
 	}
-	if latCol.Len() < minChunks {
-		minChunks = latCol.Len()
+	if latData.Len() < minChunks {
+		minChunks = latData.Len()
 	}
-	if lonCol.Len() < minChunks {
-		minChunks = lonCol.Len()
+	if lonData.Len() < minChunks {
+		minChunks = lonData.Len()
 	}
 
 	// Return early if no chunks
@@ -318,10 +341,21 @@ func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceReco
 	}
 
 	for chunkIdx := 0; chunkIdx < minChunks; chunkIdx++ {
-		deviceChunk := deviceIDCol.Chunk(chunkIdx)
-		timeChunk := timeCol.Chunk(chunkIdx)
-		latChunk := latCol.Chunk(chunkIdx)
-		lonChunk := lonCol.Chunk(chunkIdx)
+		// Additional safety: verify chunk index is valid for each column
+		if chunkIdx >= deviceIDData.Len() || chunkIdx >= timeData.Len() ||
+			chunkIdx >= latData.Len() || chunkIdx >= lonData.Len() {
+			break
+		}
+
+		deviceChunk := deviceIDData.Chunk(chunkIdx)
+		timeChunk := timeData.Chunk(chunkIdx)
+		latChunk := latData.Chunk(chunkIdx)
+		lonChunk := lonData.Chunk(chunkIdx)
+
+		// Safety check: ensure chunks are valid
+		if deviceChunk == nil || timeChunk == nil || latChunk == nil || lonChunk == nil {
+			continue
+		}
 
 		// Find minimum length across all chunks
 		chunkLen := deviceChunk.Len()
@@ -349,6 +383,8 @@ func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceReco
 				rec.DeviceID = string(arr.Value(i))
 			case *array.LargeString:
 				rec.DeviceID = arr.Value(i)
+			default:
+				continue
 			}
 
 			switch arr := timeChunk.(type) {
@@ -356,6 +392,8 @@ func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceReco
 				rec.EventTimestamp = arr.Value(i).ToTime(arrow.Nanosecond)
 			case *array.Int64:
 				rec.EventTimestamp = time.Unix(arr.Value(i), 0)
+			default:
+				continue
 			}
 
 			switch arr := latChunk.(type) {
@@ -363,6 +401,8 @@ func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceReco
 				rec.Latitude = arr.Value(i)
 			case *array.Float32:
 				rec.Latitude = float64(arr.Value(i))
+			default:
+				continue
 			}
 
 			switch arr := lonChunk.(type) {
@@ -370,6 +410,8 @@ func (dt *DeviceTracker) extractRecordsOptimized(table arrow.Table) []DeviceReco
 				rec.Longitude = arr.Value(i)
 			case *array.Float32:
 				rec.Longitude = float64(arr.Value(i))
+			default:
+				continue
 			}
 
 			records = append(records, rec)
