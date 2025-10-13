@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/ClickHouse/clickhouse-go/v2"
@@ -69,6 +71,7 @@ type DeviceTracker struct {
 	IdleDeviceBuffer float64
 	NumWorkers       int
 
+	NTFDC atomic.Int64
 	// ClickHouse connection
 	clickhouseConn *sql.DB
 	chMutex        sync.Mutex
@@ -243,6 +246,8 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, st
 				if err := dt.addToClickHouseBatch(tfRecord); err != nil {
 					fmt.Printf("Error adding to ClickHouse batch: %v\n", err)
 				}
+			} else {
+				dt.NTFDC.Add(1)
 			}
 		}
 
@@ -266,6 +271,7 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, st
 		}
 	}
 
+	log.Println("Non Time Filtered Devices Count :", dt.NTFDC.Load())
 	return intersectRecords, nil
 }
 
