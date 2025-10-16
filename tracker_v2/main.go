@@ -130,8 +130,8 @@ type DeviceRecord struct {
 
 // Minimal device record for JSON output (removes redundant fields)
 type MinimalDeviceRecord struct {
-	DeviceID       string    `json:"did"`
-	EventTimestamp time.Time `json:"et"`
+	DeviceID       string    `json:"device_id" bson:"device_id"`
+	EventTimestamp time.Time `json:"event_timestamp" bson:"event_timestamp"`
 }
 
 type TimeFilteredRecord struct {
@@ -1777,7 +1777,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 
 	mongoConfig := MongoConfig{
 		URI:        "mongodb://admin:nyros%4006@localhost:27017",
-		Database:   "device_tracking",
+		Database:   "locatrix",
 		Collection: "devices_within_campaign",
 	}
 
@@ -1790,6 +1790,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	if err != nil {
 		return fmt.Errorf("failed to create device tracker: %w", err)
 	}
+
 	defer dt.Close()
 
 	step3 := containsStep(runSteps, 3)
