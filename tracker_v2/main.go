@@ -22,6 +22,9 @@ import (
 	"github.com/apache/arrow/go/v14/parquet/file"
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/planar"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const (
@@ -35,6 +38,12 @@ type ClickHouseConfig struct {
 	Database string `json:"database"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type MongoConfig struct {
+	URI        string
+	Database   string
+	Collection string
 }
 
 // API Response structures
@@ -92,6 +101,10 @@ type DeviceTracker struct {
 	clickhouseConn *sql.DB
 	chMutex        sync.Mutex
 	chBatch        []TimeFilteredRecord
+
+	mongoClient     *mongo.Client
+	mongoCollection *mongo.Collection
+	mongoConfig     MongoConfig
 }
 
 type LocationRecord struct {
@@ -142,6 +155,17 @@ type CampaignDevices struct {
 	CampaignName string       `json:"campaign_name"`
 	POIs         []POIDevices `json:"pois"`
 	TotalDevices int          `json:"total_devices"`
+}
+
+// MongoDB document structure - each POI as separate document
+type POIMongoDocument struct {
+	ID            primitive.ObjectID    `bson:"_id,omitempty"`
+	POIID         primitive.ObjectID    `bson:"poi_id"`
+	POIName       string                `bson:"poi_name"`
+	ProcessedDate string                `bson:"processed_date"`
+	DeviceCount   int                   `bson:"device_count"`
+	Devices       []MinimalDeviceRecord `bson:"devices"`
+	CreatedAt     time.Time             `bson:"created_at"`
 }
 
 // Output structures for JSON files
@@ -294,6 +318,57 @@ func (dt *DeviceTracker) flushClickHouseBatchUnsafe() error {
 	return nil
 }
 
+func (dt *DeviceTracker) saveToMongoDB(campaignMap map[string]map[string][]MinimalDeviceRecord,
+	campaignNames map[string]string,
+	poiNames map[string]map[string]string,
+	processedDate string) error {
+
+	if dt.mongoCollection == nil {
+		fmt.Println("MongoDB not configured, skipping MongoDB save")
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var documents []interface{}
+	createdAt := time.Now()
+
+	for campaignID, poisMap := range campaignMap {
+		for poiID, devices := range poisMap {
+			// Convert POI ID string to ObjectID
+			poiObjectID, err := primitive.ObjectIDFromHex(poiID)
+			if err != nil {
+				fmt.Printf("Warning: Invalid POI ID %s, skipping: %v\n", poiID, err)
+				continue
+			}
+
+			doc := POIMongoDocument{
+				POIID:         poiObjectID,
+				POIName:       poiNames[campaignID][poiID],
+				ProcessedDate: processedDate,
+				DeviceCount:   len(devices),
+				Devices:       devices,
+				CreatedAt:     createdAt,
+			}
+			documents = append(documents, doc)
+		}
+	}
+
+	if len(documents) == 0 {
+		fmt.Println("No documents to insert into MongoDB")
+		return nil
+	}
+
+	result, err := dt.mongoCollection.InsertMany(ctx, documents)
+	if err != nil {
+		return fmt.Errorf("failed to insert documents into MongoDB: %w", err)
+	}
+
+	fmt.Printf("✅ Successfully inserted %d POI documents into MongoDB\n", len(result.InsertedIDs))
+	return nil
+}
+
 func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, step5 bool) ([]DeviceRecord, error) {
 	records, err := dt.readParquetOptimized(parqFilePath)
 	if err != nil {
@@ -356,7 +431,7 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, st
 	return intersectRecords, nil
 }
 
-func NewDeviceTracker(campaignAPIURL, outputFolder string, chConfig ClickHouseConfig) (*DeviceTracker, error) {
+func NewDeviceTracker(campaignAPIURL, outputFolder string, chConfig ClickHouseConfig, mongoConfig MongoConfig) (*DeviceTracker, error) {
 	numWorkers := runtime.NumCPU()
 	if numWorkers > 16 {
 		numWorkers = 16
@@ -379,7 +454,30 @@ func NewDeviceTracker(campaignAPIURL, outputFolder string, chConfig ClickHouseCo
 		return nil, fmt.Errorf("failed to ping ClickHouse: %w", err)
 	}
 
-	fmt.Println("Successfully connected to ClickHouse")
+	fmt.Println("✅ Successfully connected to ClickHouse")
+
+	// Connect to MongoDB
+	var mongoClient *mongo.Client
+	var mongoCollection *mongo.Collection
+
+	if mongoConfig.URI != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		clientOptions := options.Client().ApplyURI(mongoConfig.URI)
+		mongoClient, err = mongo.Connect(ctx, clientOptions)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
+		}
+
+		if err := mongoClient.Ping(ctx, nil); err != nil {
+			return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
+		}
+
+		fmt.Println("✅ Successfully connected to MongoDB")
+
+		mongoCollection = mongoClient.Database(mongoConfig.Database).Collection(mongoConfig.Collection)
+	}
 
 	dt := &DeviceTracker{
 		ctx:              context.Background(),
@@ -396,6 +494,9 @@ func NewDeviceTracker(campaignAPIURL, outputFolder string, chConfig ClickHouseCo
 		spatialIndex:     make(map[int][]int),
 		clickhouseConn:   conn,
 		chBatch:          make([]TimeFilteredRecord, 0, clickhouseBatchSize),
+		mongoClient:      mongoClient,
+		mongoCollection:  mongoCollection,
+		mongoConfig:      mongoConfig,
 	}
 
 	if err := dt.parseFilterTimes(); err != nil {
@@ -468,8 +569,15 @@ func (dt *DeviceTracker) Close() error {
 	}
 
 	if dt.clickhouseConn != nil {
-		return dt.clickhouseConn.Close()
+		dt.clickhouseConn.Close()
 	}
+
+	if dt.mongoClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		dt.mongoClient.Disconnect(ctx)
+	}
+
 	return nil
 }
 
@@ -730,7 +838,15 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		poiNames[campaignID][poiID] = unique[i].Address
 	}
 
-	// Convert to structured output
+	// Save to MongoDB first
+	if dt.mongoCollection != nil {
+		fmt.Println("\n💾 Saving to MongoDB...")
+		if err := dt.saveToMongoDB(campaignMap, campaignNames, poiNames, dateStr); err != nil {
+			fmt.Printf("Warning: MongoDB save failed: %v\n", err)
+		}
+	}
+
+	// Convert to structured output for JSON
 	campaigns := make([]CampaignDevices, 0, len(campaignMap))
 	for campaignID, poisMap := range campaignMap {
 		pois := make([]POIDevices, 0, len(poisMap))
@@ -1659,10 +1775,17 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 		Password: "nyros",
 	}
 
+	mongoConfig := MongoConfig{
+		URI:        "mongodb://admin:nyros@06@localhost:27017",
+		Database:   "device_tracking",
+		Collection: "devices_within_campaign",
+	}
+
 	dt, err := NewDeviceTracker(
 		"https://locatrix-backend-development.up.railway.app/api/admin/activecampaign/list",
 		"/home/device-tracker/data/output",
 		chConfig,
+		mongoConfig,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create device tracker: %w", err)
@@ -1716,7 +1839,7 @@ func containsStep(steps []int, step int) bool {
 
 func main() {
 	fmt.Println("===========================================")
-	fmt.Println("   Device Tracker - JSON Output Format")
+	fmt.Println("   Device Tracker - JSON + MongoDB Output")
 	fmt.Println("===========================================")
 
 	startTime := time.Now()
