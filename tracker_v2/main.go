@@ -117,10 +117,8 @@ type DeviceRecord struct {
 
 // Minimal device record for JSON output (removes redundant fields)
 type MinimalDeviceRecord struct {
-	DeviceID       string    `json:"device_id"`
-	EventTimestamp time.Time `json:"event_timestamp"`
-	Latitude       float64   `json:"latitude"`
-	Longitude      float64   `json:"longitude"`
+	DeviceID       string    `json:"did"`
+	EventTimestamp time.Time `json:"et"`
 }
 
 type TimeFilteredRecord struct {
@@ -725,8 +723,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		minimalDevice := MinimalDeviceRecord{
 			DeviceID:       unique[i].DeviceID,
 			EventTimestamp: unique[i].EventTimestamp,
-			Latitude:       unique[i].Latitude,
-			Longitude:      unique[i].Longitude,
 		}
 
 		campaignMap[campaignID][poiID] = append(campaignMap[campaignID][poiID], minimalDevice)
@@ -1037,8 +1033,6 @@ func (dt *DeviceTracker) findIdleDevicesFromClickHouse(targetDate string, output
 				fullDevice := DeviceRecord{
 					DeviceID:       device.DeviceID,
 					EventTimestamp: device.EventTimestamp,
-					Latitude:       device.Latitude,
-					Longitude:      device.Longitude,
 					Campaign:       campaign.CampaignName,
 					CampaignID:     campaign.CampaignID,
 					POIID:          poi.POIID,
@@ -1203,8 +1197,6 @@ func (dt *DeviceTracker) findIdleDevicesFromClickHouse(targetDate string, output
 		minimalDevice := MinimalDeviceRecord{
 			DeviceID:       unique[i].DeviceID,
 			EventTimestamp: unique[i].VisitTime,
-			Latitude:       unique[i].Latitude,
-			Longitude:      unique[i].Longitude,
 		}
 
 		campaignMap[campaignID][poiID] = append(campaignMap[campaignID][poiID], minimalDevice)
@@ -1647,6 +1639,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	dates := []string{
+		"2025-10-13",
 		"2025-10-14",
 	}
 
@@ -1729,7 +1722,7 @@ func main() {
 
 	startTime := time.Now()
 
-	runSteps := []int{3, 4, 6}
+	runSteps := []int{4, 5, 6}
 
 	err := RunDeviceTracker(true, true, runSteps)
 	if err != nil {
