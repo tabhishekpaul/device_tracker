@@ -1639,7 +1639,6 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	dates := []string{
-		"2025-10-13",
 		"2025-10-14",
 	}
 
@@ -1722,7 +1721,7 @@ func main() {
 
 	startTime := time.Now()
 
-	runSteps := []int{4, 5, 6}
+	runSteps := []int{3}
 
 	err := RunDeviceTracker(true, true, runSteps)
 	if err != nil {
