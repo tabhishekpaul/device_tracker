@@ -1776,7 +1776,7 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	}
 
 	mongoConfig := MongoConfig{
-		URI:        "mongodb://admin:nyros@06@localhost:27017",
+		URI:        "mongodb://admin:nyros%4006@localhost:27017",
 		Database:   "device_tracking",
 		Collection: "devices_within_campaign",
 	}
