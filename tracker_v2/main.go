@@ -1470,7 +1470,7 @@ func main() {
 
 	startTime := time.Now()
 
-	runSteps := []int{3, 5}
+	runSteps := []int{5}
 
 	err := RunDeviceTracker(true, true, runSteps)
 	if err != nil {
