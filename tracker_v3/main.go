@@ -156,7 +156,7 @@ func ProcessIdleDevicesForDeviceIDs(chConfig ClickHouseConfig, deviceIDs []strin
 	log.Println("idle_devices table truncated successfully")
 
 	// MAXIMUM PARALLELIZATION SETTINGS for 40-core Azure machine
-	numCPU := runtime.NumCPU()
+	numCPU := 48
 	runtime.GOMAXPROCS(numCPU) // Ensure Go uses all CPUs
 
 	chunkSize := 5000        // Smaller chunks for 40 cores = more parallelism
