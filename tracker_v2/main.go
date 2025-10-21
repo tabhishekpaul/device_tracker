@@ -315,10 +315,10 @@ func (dt *DeviceTracker) flushParquetBatchUnsafe() error {
 	pool := memory.NewGoAllocator()
 
 	deviceIDBuilder := array.NewStringBuilder(pool)
-	eventTimestampBuilder := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Microsecond})
+	eventTimestampBuilder := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"})
 	latitudeBuilder := array.NewFloat64Builder(pool)
 	longitudeBuilder := array.NewFloat64Builder(pool)
-	loadDateBuilder := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Microsecond})
+	loadDateBuilder := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"})
 
 	for i := range dt.parquetBatch {
 		deviceIDBuilder.Append(dt.parquetBatch[i].DeviceID)
