@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,9 +16,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/apache/arrow/go/v14/arrow"
+	"github.com/apache/arrow/go/v14/arrow/array"
+	"github.com/apache/arrow/go/v14/arrow/memory"
 	"github.com/apache/arrow/go/v14/parquet"
+	"github.com/apache/arrow/go/v14/parquet/compress"
 	"github.com/apache/arrow/go/v14/parquet/file"
+	"github.com/apache/arrow/go/v14/parquet/pqarrow"
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/planar"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -28,17 +31,9 @@ import (
 )
 
 const (
-	workerPoolSize      = 20
-	clickhouseBatchSize = 3000000
+	workerPoolSize   = 20
+	parquetBatchSize = 1000000
 )
-
-type ClickHouseConfig struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Database string `json:"database"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
 
 type MongoConfig struct {
 	URI        string
@@ -98,9 +93,13 @@ type DeviceTracker struct {
 
 	NTFDC atomic.Int64
 
-	clickhouseConn *sql.DB
-	chMutex        sync.Mutex
-	chBatch        []TimeFilteredRecord
+	// Parquet batch writer fields
+	parquetMutex  sync.Mutex
+	parquetBatch  []TimeFilteredRecord
+	parquetWriter *pqarrow.FileWriter
+	parquetFile   *os.File
+	parquetSchema *arrow.Schema
+	currentDate   string
 
 	mongoClient     *mongo.Client
 	mongoCollection *mongo.Collection
@@ -186,26 +185,6 @@ type MergedCampaignOutput struct {
 	Campaigns        []CampaignDevices `json:"campaigns"`
 }
 
-type IdleDevicesOutput struct {
-	ProcessedDate    string            `json:"processed_date"`
-	TotalIdleDevices int               `json:"total_idle_devices"`
-	TotalCampaigns   int               `json:"total_campaigns"`
-	BufferMeters     float64           `json:"buffer_meters"`
-	ProcessingTimeMs int64             `json:"processing_time_ms"`
-	Campaigns        []CampaignDevices `json:"campaigns"`
-}
-
-type FinalIdleDevicesOutput struct {
-	ProcessedDates    []string          `json:"processed_dates"`
-	TotalIdleDevices  int               `json:"total_idle_devices"`
-	UniqueIdleDevices int               `json:"unique_idle_devices"`
-	TotalCampaigns    int               `json:"total_campaigns"`
-	BufferMeters      float64           `json:"buffer_meters"`
-	ProcessingTimeMs  int64             `json:"processing_time_ms"`
-	DevicesByCampaign map[string]int    `json:"devices_by_campaign"`
-	Campaigns         []CampaignDevices `json:"campaigns"`
-}
-
 type TimeFilterOutput struct {
 	ProcessedDate     string `json:"processed_date"`
 	FilterStartTime   string `json:"filter_start_time"`
@@ -268,52 +247,138 @@ func (dt *DeviceTracker) isWithinTimeFilter(eventTime time.Time) bool {
 	return eventSeconds >= dt.startSeconds || eventSeconds < dt.endSeconds
 }
 
-func (dt *DeviceTracker) flushClickHouseBatchUnsafe() error {
-	if len(dt.chBatch) == 0 {
+func (dt *DeviceTracker) initParquetWriter(dateStr string) error {
+	dt.parquetMutex.Lock()
+	defer dt.parquetMutex.Unlock()
+
+	if dt.parquetWriter != nil && dt.currentDate == dateStr {
 		return nil
 	}
 
-	tx, err := dt.clickhouseConn.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+	if dt.parquetWriter != nil {
+		dt.closeParquetWriterUnsafe()
 	}
 
-	stmt, err := tx.Prepare(`
-		INSERT INTO time_filtered (
-			device_id, 
-			event_timestamp, 
-			latitude, 
-			longitude, 
-			load_date
-		) VALUES (?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to prepare statement: %w", err)
-	}
-	defer stmt.Close()
+	step5Folder := filepath.Join(dt.OutputFolder, "step5_time_filtered", dateStr)
+	os.MkdirAll(step5Folder, 0755)
 
-	for i := range dt.chBatch {
-		_, err := stmt.Exec(
-			dt.chBatch[i].DeviceID,
-			dt.chBatch[i].EventTimestamp,
-			dt.chBatch[i].Latitude,
-			dt.chBatch[i].Longitude,
-			dt.chBatch[i].LoadDate,
-		)
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to execute statement: %w", err)
+	// Format: time_filtered_loaddate20251020.parquet
+	parquetPath := filepath.Join(step5Folder, fmt.Sprintf("time_filtered_loaddate%s.parquet", dateStr))
+
+	file, err := os.Create(parquetPath)
+	if err != nil {
+		return fmt.Errorf("failed to create parquet file: %w", err)
+	}
+
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "device_id", Type: arrow.BinaryTypes.String},
+			{Name: "event_timestamp", Type: arrow.FixedWidthTypes.Timestamp_us},
+			{Name: "latitude", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "longitude", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "load_date", Type: arrow.FixedWidthTypes.Timestamp_us},
+		},
+		nil,
+	)
+
+	props := parquet.NewWriterProperties(
+		parquet.WithCompression(compress.Codecs.Snappy),
+		parquet.WithDictionaryDefault(true),
+	)
+
+	writer, err := pqarrow.NewFileWriter(schema, file, props, pqarrow.DefaultWriterProps())
+	if err != nil {
+		file.Close()
+		return fmt.Errorf("failed to create parquet writer: %w", err)
+	}
+
+	dt.parquetWriter = writer
+	dt.parquetFile = file
+	dt.parquetSchema = schema
+	dt.currentDate = dateStr
+	dt.parquetBatch = make([]TimeFilteredRecord, 0, parquetBatchSize)
+
+	fmt.Printf("✅ Initialized Parquet writer for date: %s at %s\n", dateStr, parquetPath)
+
+	return nil
+}
+
+func (dt *DeviceTracker) flushParquetBatchUnsafe() error {
+	if len(dt.parquetBatch) == 0 {
+		return nil
+	}
+
+	if dt.parquetWriter == nil {
+		return fmt.Errorf("parquet writer not initialized")
+	}
+
+	pool := memory.NewGoAllocator()
+
+	deviceIDBuilder := array.NewStringBuilder(pool)
+	eventTimestampBuilder := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Microsecond})
+	latitudeBuilder := array.NewFloat64Builder(pool)
+	longitudeBuilder := array.NewFloat64Builder(pool)
+	loadDateBuilder := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Microsecond})
+
+	for i := range dt.parquetBatch {
+		deviceIDBuilder.Append(dt.parquetBatch[i].DeviceID)
+		eventTimestampBuilder.Append(arrow.Timestamp(dt.parquetBatch[i].EventTimestamp.UnixMicro()))
+		latitudeBuilder.Append(dt.parquetBatch[i].Latitude)
+		longitudeBuilder.Append(dt.parquetBatch[i].Longitude)
+		loadDateBuilder.Append(arrow.Timestamp(dt.parquetBatch[i].LoadDate.UnixMicro()))
+	}
+
+	deviceIDArray := deviceIDBuilder.NewArray()
+	eventTimestampArray := eventTimestampBuilder.NewArray()
+	latitudeArray := latitudeBuilder.NewArray()
+	longitudeArray := longitudeBuilder.NewArray()
+	loadDateArray := loadDateBuilder.NewArray()
+
+	defer deviceIDArray.Release()
+	defer eventTimestampArray.Release()
+	defer latitudeArray.Release()
+	defer longitudeArray.Release()
+	defer loadDateArray.Release()
+
+	record := array.NewRecord(
+		dt.parquetSchema,
+		[]arrow.Array{deviceIDArray, eventTimestampArray, latitudeArray, longitudeArray, loadDateArray},
+		int64(len(dt.parquetBatch)),
+	)
+	defer record.Release()
+
+	if err := dt.parquetWriter.Write(record); err != nil {
+		return fmt.Errorf("failed to write to parquet: %w", err)
+	}
+
+	fmt.Printf("Flushed %d records to Parquet\n", len(dt.parquetBatch))
+
+	dt.parquetBatch = dt.parquetBatch[:0]
+
+	return nil
+}
+
+func (dt *DeviceTracker) closeParquetWriterUnsafe() error {
+	if dt.parquetWriter == nil {
+		return nil
+	}
+
+	if len(dt.parquetBatch) > 0 {
+		if err := dt.flushParquetBatchUnsafe(); err != nil {
+			fmt.Printf("Error flushing final batch: %v\n", err)
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+	if err := dt.parquetWriter.Close(); err != nil {
+		fmt.Printf("Error closing parquet writer: %v\n", err)
 	}
 
-	fmt.Printf("Flushed %d records to ClickHouse\n", len(dt.chBatch))
+	if dt.parquetFile != nil {
+		dt.parquetFile.Close()
+	}
 
-	dt.chBatch = dt.chBatch[:0]
+	dt.parquetWriter = nil
+	dt.parquetFile = nil
 
 	return nil
 }
@@ -336,7 +401,6 @@ func (dt *DeviceTracker) saveToMongoDB(campaignMap map[string]map[string][]Minim
 
 	for campaignID, poisMap := range campaignMap {
 		for poiID, devices := range poisMap {
-			// Convert POI ID string to ObjectID
 			poiObjectID, err := primitive.ObjectIDFromHex(poiID)
 			if err != nil {
 				fmt.Printf("Warning: Invalid POI ID %s, skipping: %v\n", poiID, err)
@@ -397,8 +461,8 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, st
 					LoadDate:       loadDate,
 				}
 
-				if err := dt.addToClickHouseBatch(tfRecord); err != nil {
-					fmt.Printf("Error adding to ClickHouse batch: %v\n", err)
+				if err := dt.addToParquetBatch(tfRecord, dateStr); err != nil {
+					fmt.Printf("Error adding to Parquet batch: %v\n", err)
 				}
 			} else {
 				dt.NTFDC.Add(1)
@@ -431,32 +495,12 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, st
 	return intersectRecords, nil
 }
 
-func NewDeviceTracker(campaignAPIURL, outputFolder string, chConfig ClickHouseConfig, mongoConfig MongoConfig) (*DeviceTracker, error) {
+func NewDeviceTracker(campaignAPIURL, outputFolder string, mongoConfig MongoConfig) (*DeviceTracker, error) {
 	numWorkers := runtime.NumCPU()
 	if numWorkers > 16 {
 		numWorkers = 16
 	}
 
-	dsn := fmt.Sprintf("clickhouse://%s:%s@%s:%d/%s",
-		chConfig.Username,
-		chConfig.Password,
-		chConfig.Host,
-		chConfig.Port,
-		chConfig.Database,
-	)
-
-	conn, err := sql.Open("clickhouse", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to ClickHouse: %w", err)
-	}
-
-	if err := conn.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping ClickHouse: %w", err)
-	}
-
-	fmt.Println("✅ Successfully connected to ClickHouse")
-
-	// Connect to MongoDB
 	var mongoClient *mongo.Client
 	var mongoCollection *mongo.Collection
 
@@ -465,6 +509,7 @@ func NewDeviceTracker(campaignAPIURL, outputFolder string, chConfig ClickHouseCo
 		defer cancel()
 
 		clientOptions := options.Client().ApplyURI(mongoConfig.URI)
+		var err error
 		mongoClient, err = mongo.Connect(ctx, clientOptions)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
@@ -492,8 +537,7 @@ func NewDeviceTracker(campaignAPIURL, outputFolder string, chConfig ClickHouseCo
 		IdleDeviceBuffer: 10.0,
 		NumWorkers:       numWorkers,
 		spatialIndex:     make(map[int][]int),
-		clickhouseConn:   conn,
-		chBatch:          make([]TimeFilteredRecord, 0, clickhouseBatchSize),
+		parquetBatch:     make([]TimeFilteredRecord, 0, parquetBatchSize),
 		mongoClient:      mongoClient,
 		mongoCollection:  mongoCollection,
 		mongoConfig:      mongoConfig,
@@ -559,17 +603,11 @@ func (dt *DeviceTracker) parseFilterTimes() error {
 }
 
 func (dt *DeviceTracker) Close() error {
-	dt.chMutex.Lock()
-	defer dt.chMutex.Unlock()
+	dt.parquetMutex.Lock()
+	defer dt.parquetMutex.Unlock()
 
-	if len(dt.chBatch) > 0 {
-		if err := dt.flushClickHouseBatchUnsafe(); err != nil {
-			fmt.Printf("Error flushing final batch: %v\n", err)
-		}
-	}
-
-	if dt.clickhouseConn != nil {
-		dt.clickhouseConn.Close()
+	if err := dt.closeParquetWriterUnsafe(); err != nil {
+		fmt.Printf("Error closing parquet writer: %v\n", err)
 	}
 
 	if dt.mongoClient != nil {
@@ -581,14 +619,23 @@ func (dt *DeviceTracker) Close() error {
 	return nil
 }
 
-func (dt *DeviceTracker) addToClickHouseBatch(record TimeFilteredRecord) error {
-	dt.chMutex.Lock()
-	defer dt.chMutex.Unlock()
+func (dt *DeviceTracker) addToParquetBatch(record TimeFilteredRecord, dateStr string) error {
+	dt.parquetMutex.Lock()
+	defer dt.parquetMutex.Unlock()
 
-	dt.chBatch = append(dt.chBatch, record)
+	if dt.parquetWriter == nil || dt.currentDate != dateStr {
+		dt.parquetMutex.Unlock()
+		if err := dt.initParquetWriter(dateStr); err != nil {
+			dt.parquetMutex.Lock()
+			return err
+		}
+		dt.parquetMutex.Lock()
+	}
 
-	if len(dt.chBatch) >= clickhouseBatchSize {
-		return dt.flushClickHouseBatchUnsafe()
+	dt.parquetBatch = append(dt.parquetBatch, record)
+
+	if len(dt.parquetBatch) >= parquetBatchSize {
+		return dt.flushParquetBatchUnsafe()
 	}
 
 	return nil
@@ -749,8 +796,14 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 
 	fmt.Printf("Total Files: %d\n", len(fileList))
 
-	// Create subfolder for this date
 	dateStr := dt.extractDateFromPath(parquetFolder)
+
+	if step5 {
+		if err := dt.initParquetWriter(dateStr); err != nil {
+			return fmt.Errorf("failed to initialize parquet writer: %w", err)
+		}
+	}
+
 	step3Folder := filepath.Join(dt.OutputFolder, "step3_campaign_intersection", dateStr)
 	os.MkdirAll(step3Folder, 0755)
 
@@ -797,7 +850,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 	close(results)
 	resultWg.Wait()
 
-	// Remove duplicates
 	seen := make(map[string]struct{})
 	unique := make([]DeviceRecord, 0, len(allRecords))
 	for i := range allRecords {
@@ -807,7 +859,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		}
 	}
 
-	// Organize by Campaign -> POI -> Devices
 	campaignMap := make(map[string]map[string][]MinimalDeviceRecord)
 	campaignNames := make(map[string]string)
 	poiNames := make(map[string]map[string]string)
@@ -827,7 +878,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 			poiNames[campaignID] = make(map[string]string)
 		}
 
-		// Create minimal device record without redundant fields
 		minimalDevice := MinimalDeviceRecord{
 			DeviceID:       unique[i].DeviceID,
 			EventTimestamp: unique[i].EventTimestamp,
@@ -838,7 +888,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		poiNames[campaignID][poiID] = unique[i].Address
 	}
 
-	// Save to MongoDB first
 	if dt.mongoCollection != nil {
 		fmt.Println("\n💾 Saving to MongoDB...")
 		if err := dt.saveToMongoDB(campaignMap, campaignNames, poiNames, dateStr); err != nil {
@@ -846,7 +895,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		}
 	}
 
-	// Convert to structured output for JSON
 	campaigns := make([]CampaignDevices, 0, len(campaignMap))
 	for campaignID, poisMap := range campaignMap {
 		pois := make([]POIDevices, 0, len(poisMap))
@@ -870,7 +918,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		})
 	}
 
-	// Save to JSON
 	output := CampaignIntersectionOutput{
 		ProcessedDate:    dateStr,
 		TotalDevices:     len(unique),
@@ -887,7 +934,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 	fmt.Printf("(DT) Completed step 3 in %v - Saved %d devices to %s\n",
 		time.Since(startTime), len(unique), jsonPath)
 
-	// Also save time filter stats if step5 was run
 	if step5 {
 		step5Folder := filepath.Join(dt.OutputFolder, "step5_time_filtered", dateStr)
 		os.MkdirAll(step5Folder, 0755)
@@ -906,6 +952,8 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		if err := dt.saveJSON(statsPath, timeFilterStats); err != nil {
 			fmt.Printf("Warning: failed to save time filter stats: %v\n", err)
 		}
+
+		fmt.Printf("✅ Time-filtered data saved to Parquet in: %s\n", step5Folder)
 	}
 
 	return nil
@@ -951,7 +999,6 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsJSON(folderList []string) err
 		close(results)
 	}()
 
-	// Collect all campaigns
 	allCampaignMap := make(map[string]map[string][]MinimalDeviceRecord)
 	allCampaignNames := make(map[string]string)
 	allPOINames := make(map[string]map[string]string)
@@ -984,7 +1031,6 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsJSON(folderList []string) err
 		}
 	}
 
-	// Convert to structured output for all devices
 	allCampaigns := make([]CampaignDevices, 0, len(allCampaignMap))
 	for campaignID, poisMap := range allCampaignMap {
 		pois := make([]POIDevices, 0, len(poisMap))
@@ -1008,7 +1054,6 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsJSON(folderList []string) err
 		})
 	}
 
-	// Save all devices
 	allOutput := MergedCampaignOutput{
 		ProcessedDates:   processedDates,
 		TotalDevices:     totalDeviceCount,
@@ -1023,7 +1068,6 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsJSON(folderList []string) err
 		return fmt.Errorf("failed to save all devices: %w", err)
 	}
 
-	// Create unique devices list
 	uniqueCampaignMap := make(map[string]map[string][]MinimalDeviceRecord)
 	uniqueCampaignNames := make(map[string]string)
 	uniquePOINames := make(map[string]map[string]string)
@@ -1053,7 +1097,6 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsJSON(folderList []string) err
 		}
 	}
 
-	// Convert to structured output for unique devices
 	uniqueCampaigns := make([]CampaignDevices, 0, len(uniqueCampaignMap))
 	for campaignID, poisMap := range uniqueCampaignMap {
 		pois := make([]POIDevices, 0, len(poisMap))
@@ -1099,391 +1142,6 @@ func (dt *DeviceTracker) MergeCampaignIntersectionsJSON(folderList []string) err
 	fmt.Printf("  Total devices: %d\n", totalDeviceCount)
 	fmt.Printf("  Unique devices: %d\n", uniqueCount)
 	fmt.Printf("  Saved to: %s\n", step4Folder)
-
-	return nil
-}
-
-func (dt *DeviceTracker) RunIdleDeviceSearch(targetDates []string) error {
-	fmt.Println("(DT) Started step 6 - Idle Device Search")
-	startTime := time.Now()
-
-	step6Folder := filepath.Join(dt.OutputFolder, "step6_idle_devices")
-	os.MkdirAll(step6Folder, 0755)
-
-	for _, date := range targetDates {
-		fmt.Printf("Processing date: %s\n", date)
-
-		err := dt.findIdleDevicesFromClickHouse(date, step6Folder)
-		if err != nil {
-			fmt.Printf("Error for %s: %v\n", date, err)
-		}
-	}
-
-	err := dt.mergeIdleDevicesOutput(targetDates, step6Folder)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("(DT) Completed step 6 in %v\n", time.Since(startTime))
-	return nil
-}
-
-func (dt *DeviceTracker) findIdleDevicesFromClickHouse(targetDate string, outputFolder string) error {
-	stepStartTime := time.Now()
-
-	// Load unique device data from merged campaign JSON
-	step4Folder := filepath.Join(dt.OutputFolder, "step4_merged_campaigns")
-	uniquePath := filepath.Join(step4Folder, "unique_campaign_devices.json")
-
-	var mergedOutput MergedCampaignOutput
-	if err := dt.loadJSON(uniquePath, &mergedOutput); err != nil {
-		return fmt.Errorf("failed to load merged campaign devices: %w", err)
-	}
-
-	// Extract all devices from the campaigns structure and build a map
-	uniqDeviceMap := make(map[string]DeviceRecord)
-	for _, campaign := range mergedOutput.Campaigns {
-		for _, poi := range campaign.POIs {
-			for _, device := range poi.Devices {
-				// Reconstruct full DeviceRecord with campaign and POI info
-				fullDevice := DeviceRecord{
-					DeviceID:       device.DeviceID,
-					EventTimestamp: device.EventTimestamp,
-					Campaign:       campaign.CampaignName,
-					CampaignID:     campaign.CampaignID,
-					POIID:          poi.POIID,
-					Address:        poi.POIName,
-				}
-				uniqDeviceMap[device.DeviceID] = fullDevice
-			}
-		}
-	}
-
-	parseDate, _ := time.Parse("2006-01-02", targetDate)
-
-	query := `
-		SELECT device_id, event_timestamp, latitude, longitude
-		FROM time_filtered
-		WHERE toDate(load_date) = ?
-		ORDER BY device_id, event_timestamp
-	`
-
-	rows, err := dt.clickhouseConn.Query(query, parseDate)
-	if err != nil {
-		return fmt.Errorf("failed to query ClickHouse: %w", err)
-	}
-	defer rows.Close()
-
-	deviceGroups := make(map[string][]DeviceRecord)
-
-	for rows.Next() {
-		var rec DeviceRecord
-		if err := rows.Scan(&rec.DeviceID, &rec.EventTimestamp, &rec.Latitude, &rec.Longitude); err != nil {
-			return fmt.Errorf("failed to scan row: %w", err)
-		}
-		deviceGroups[rec.DeviceID] = append(deviceGroups[rec.DeviceID], rec)
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error iterating rows: %w", err)
-	}
-
-	fmt.Printf("Loaded %d devices from ClickHouse for date %s\n", len(deviceGroups), targetDate)
-
-	if len(deviceGroups) == 0 {
-		return nil
-	}
-
-	deviceIDs := make([]string, 0, len(deviceGroups))
-	for id := range deviceGroups {
-		deviceIDs = append(deviceIDs, id)
-	}
-
-	type idleDevice struct {
-		DeviceID   string
-		CampaignID string
-		POIID      string
-		Campaign   string
-		Address    string
-		Latitude   float64
-		Longitude  float64
-		VisitTime  time.Time
-	}
-
-	idleDevicesChan := make(chan idleDevice, len(deviceIDs))
-	var processWg sync.WaitGroup
-
-	workerCount := runtime.NumCPU()
-	chunkSize := (len(deviceIDs) + workerCount - 1) / workerCount
-
-	for w := 0; w < workerCount; w++ {
-		start := w * chunkSize
-		end := start + chunkSize
-		if end > len(deviceIDs) {
-			end = len(deviceIDs)
-		}
-		if start >= len(deviceIDs) {
-			break
-		}
-
-		processWg.Add(1)
-		go func(deviceIDChunk []string) {
-			defer processWg.Done()
-
-			for _, deviceID := range deviceIDChunk {
-				deviceDF := deviceGroups[deviceID]
-				if len(deviceDF) == 0 {
-					continue
-				}
-
-				campRec, exists := uniqDeviceMap[deviceID]
-				if !exists {
-					continue
-				}
-
-				firstRec := deviceDF[0]
-				firstPoint := orb.Point{firstRec.Longitude, firstRec.Latitude}
-				bufferPolygon := dt.createBufferOptimized(firstPoint, dt.IdleDeviceBuffer)
-
-				isIdle := true
-				for i := range deviceDF {
-					point := orb.Point{deviceDF[i].Longitude, deviceDF[i].Latitude}
-					if !planar.PolygonContains(bufferPolygon, point) {
-						isIdle = false
-						break
-					}
-				}
-
-				if isIdle {
-					idleDevicesChan <- idleDevice{
-						DeviceID:   deviceID,
-						CampaignID: campRec.CampaignID,
-						POIID:      campRec.POIID,
-						Campaign:   campRec.Campaign,
-						Address:    campRec.Address,
-						Latitude:   firstRec.Latitude,
-						Longitude:  firstRec.Longitude,
-						VisitTime:  campRec.EventTimestamp,
-					}
-				}
-			}
-		}(deviceIDs[start:end])
-	}
-
-	go func() {
-		processWg.Wait()
-		close(idleDevicesChan)
-	}()
-
-	idleDevices := make([]idleDevice, 0)
-	for rec := range idleDevicesChan {
-		idleDevices = append(idleDevices, rec)
-	}
-
-	// Remove duplicates
-	seen := make(map[string]struct{})
-	unique := make([]idleDevice, 0, len(idleDevices))
-	for i := range idleDevices {
-		if _, exists := seen[idleDevices[i].DeviceID]; !exists {
-			seen[idleDevices[i].DeviceID] = struct{}{}
-			unique = append(unique, idleDevices[i])
-		}
-	}
-
-	// Organize by Campaign -> POI -> Devices
-	campaignMap := make(map[string]map[string][]MinimalDeviceRecord)
-	campaignNames := make(map[string]string)
-	poiNames := make(map[string]map[string]string)
-
-	for i := range unique {
-		campaignID := unique[i].CampaignID
-		if campaignID == "" {
-			campaignID = "unknown"
-		}
-		poiID := unique[i].POIID
-		if poiID == "" {
-			poiID = "unknown"
-		}
-
-		if _, exists := campaignMap[campaignID]; !exists {
-			campaignMap[campaignID] = make(map[string][]MinimalDeviceRecord)
-			poiNames[campaignID] = make(map[string]string)
-		}
-
-		minimalDevice := MinimalDeviceRecord{
-			DeviceID:       unique[i].DeviceID,
-			EventTimestamp: unique[i].VisitTime,
-		}
-
-		campaignMap[campaignID][poiID] = append(campaignMap[campaignID][poiID], minimalDevice)
-		campaignNames[campaignID] = unique[i].Campaign
-		poiNames[campaignID][poiID] = unique[i].Address
-	}
-
-	// Convert to structured output
-	campaigns := make([]CampaignDevices, 0, len(campaignMap))
-	for campaignID, poisMap := range campaignMap {
-		pois := make([]POIDevices, 0, len(poisMap))
-		totalDevices := 0
-
-		for poiID, devices := range poisMap {
-			pois = append(pois, POIDevices{
-				POIID:   poiID,
-				POIName: poiNames[campaignID][poiID],
-				Devices: devices,
-				Count:   len(devices),
-			})
-			totalDevices += len(devices)
-		}
-
-		campaigns = append(campaigns, CampaignDevices{
-			CampaignID:   campaignID,
-			CampaignName: campaignNames[campaignID],
-			POIs:         pois,
-			TotalDevices: totalDevices,
-		})
-	}
-
-	output := IdleDevicesOutput{
-		ProcessedDate:    targetDate,
-		TotalIdleDevices: len(unique),
-		TotalCampaigns:   len(campaigns),
-		BufferMeters:     dt.IdleDeviceBuffer,
-		ProcessingTimeMs: time.Since(stepStartTime).Milliseconds(),
-		Campaigns:        campaigns,
-	}
-
-	jsonPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices_%s.json", strings.ReplaceAll(targetDate, "-", "")))
-	if err := dt.saveJSON(jsonPath, output); err != nil {
-		return fmt.Errorf("failed to save idle devices: %w", err)
-	}
-
-	fmt.Printf("Idle devices found: %d - Saved to %s\n", len(unique), jsonPath)
-	return nil
-}
-
-func (dt *DeviceTracker) mergeIdleDevicesOutput(targetDates []string, step6Folder string) error {
-	fmt.Println("Merging all idle device results...")
-	startTime := time.Now()
-
-	allCampaignMap := make(map[string]map[string][]MinimalDeviceRecord)
-	allCampaignNames := make(map[string]string)
-	allPOINames := make(map[string]map[string]string)
-	var processedDates []string
-
-	for _, targetDate := range targetDates {
-		dateStr := strings.ReplaceAll(targetDate, "-", "")
-		jsonPath := filepath.Join(step6Folder, fmt.Sprintf("idle_devices_%s.json", dateStr))
-
-		var output IdleDevicesOutput
-		if err := dt.loadJSON(jsonPath, &output); err != nil {
-			fmt.Printf("Warning: failed to load %s: %v\n", jsonPath, err)
-			continue
-		}
-
-		processedDates = append(processedDates, targetDate)
-
-		// Merge campaigns
-		for _, campaign := range output.Campaigns {
-			if _, exists := allCampaignMap[campaign.CampaignID]; !exists {
-				allCampaignMap[campaign.CampaignID] = make(map[string][]MinimalDeviceRecord)
-				allPOINames[campaign.CampaignID] = make(map[string]string)
-			}
-			allCampaignNames[campaign.CampaignID] = campaign.CampaignName
-
-			for _, poi := range campaign.POIs {
-				allCampaignMap[campaign.CampaignID][poi.POIID] = append(
-					allCampaignMap[campaign.CampaignID][poi.POIID],
-					poi.Devices...,
-				)
-				allPOINames[campaign.CampaignID][poi.POIID] = poi.POIName
-			}
-		}
-	}
-
-	if len(allCampaignMap) == 0 {
-		fmt.Println("No idle devices found to merge")
-		return nil
-	}
-
-	// Create unique list by device_id + campaign
-	seen := make(map[string]struct{})
-	uniqueCampaignMap := make(map[string]map[string][]MinimalDeviceRecord)
-	campaignCount := make(map[string]int)
-	totalCount := 0
-	uniqueCount := 0
-
-	for campaignID, poisMap := range allCampaignMap {
-		if _, exists := uniqueCampaignMap[campaignID]; !exists {
-			uniqueCampaignMap[campaignID] = make(map[string][]MinimalDeviceRecord)
-		}
-
-		for poiID, devices := range poisMap {
-			totalCount += len(devices)
-
-			for i := range devices {
-				key := devices[i].DeviceID + "|" + campaignID
-				if _, exists := seen[key]; !exists {
-					seen[key] = struct{}{}
-					uniqueCampaignMap[campaignID][poiID] = append(
-						uniqueCampaignMap[campaignID][poiID],
-						devices[i],
-					)
-					campaignCount[allCampaignNames[campaignID]]++
-					uniqueCount++
-				}
-			}
-		}
-	}
-
-	// Convert to structured output
-	campaigns := make([]CampaignDevices, 0, len(uniqueCampaignMap))
-	for campaignID, poisMap := range uniqueCampaignMap {
-		pois := make([]POIDevices, 0, len(poisMap))
-		totalDevices := 0
-
-		for poiID, devices := range poisMap {
-			if len(devices) > 0 {
-				pois = append(pois, POIDevices{
-					POIID:   poiID,
-					POIName: allPOINames[campaignID][poiID],
-					Devices: devices,
-					Count:   len(devices),
-				})
-				totalDevices += len(devices)
-			}
-		}
-
-		if totalDevices > 0 {
-			campaigns = append(campaigns, CampaignDevices{
-				CampaignID:   campaignID,
-				CampaignName: allCampaignNames[campaignID],
-				POIs:         pois,
-				TotalDevices: totalDevices,
-			})
-		}
-	}
-
-	output := FinalIdleDevicesOutput{
-		ProcessedDates:    processedDates,
-		TotalIdleDevices:  totalCount,
-		UniqueIdleDevices: uniqueCount,
-		TotalCampaigns:    len(campaigns),
-		BufferMeters:      dt.IdleDeviceBuffer,
-		ProcessingTimeMs:  time.Since(startTime).Milliseconds(),
-		DevicesByCampaign: campaignCount,
-		Campaigns:         campaigns,
-	}
-
-	finalPath := filepath.Join(step6Folder, "final_idle_devices.json")
-	if err := dt.saveJSON(finalPath, output); err != nil {
-		return fmt.Errorf("failed to save final idle devices: %w", err)
-	}
-
-	fmt.Printf("Final idle devices saved to: %s\n", finalPath)
-	fmt.Printf("  Total idle devices: %d\n", totalCount)
-	fmt.Printf("  Unique idle devices: %d\n", uniqueCount)
-	fmt.Printf("  Campaigns: %d\n", len(campaignCount))
 
 	return nil
 }
@@ -1727,20 +1385,6 @@ func (dt *DeviceTracker) readFloatColumn(rg *file.RowGroupReader, colIdx int, nu
 	return result
 }
 
-func (dt *DeviceTracker) createBufferOptimized(point orb.Point, meters float64) orb.Polygon {
-	degreeOffset := meters / 111320.0
-
-	ring := orb.Ring{
-		{point[0] - degreeOffset, point[1] - degreeOffset},
-		{point[0] + degreeOffset, point[1] - degreeOffset},
-		{point[0] + degreeOffset, point[1] + degreeOffset},
-		{point[0] - degreeOffset, point[1] + degreeOffset},
-		{point[0] - degreeOffset, point[1] - degreeOffset},
-	}
-
-	return orb.Polygon{ring}
-}
-
 func (dt *DeviceTracker) extractDateFromPath(path string) string {
 	parts := strings.Split(path, string(filepath.Separator))
 	for _, part := range parts {
@@ -1767,14 +1411,6 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	fmt.Printf("Folder List: %v\n", folderList)
 	fmt.Printf("CPU Cores: %d\n", runtime.NumCPU())
 
-	chConfig := ClickHouseConfig{
-		Host:     "172.173.97.164",
-		Port:     9000,
-		Database: "device_tracking",
-		Username: "default",
-		Password: "nyros",
-	}
-
 	mongoConfig := MongoConfig{
 		URI:        "mongodb://admin:nyros%4006@localhost:27017",
 		Database:   "locatrix",
@@ -1784,7 +1420,6 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 	dt, err := NewDeviceTracker(
 		"https://locatrix-backend-development.up.railway.app/api/admin/activecampaign/list",
 		"/home/device-tracker/data/output",
-		chConfig,
 		mongoConfig,
 	)
 	if err != nil {
@@ -1816,16 +1451,6 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 		fmt.Println("Step 4 Completed")
 	}
 
-	if containsStep(runSteps, 6) {
-		fmt.Println("\n========== Running STEP 6 ==========")
-		err := dt.RunIdleDeviceSearch(dates)
-		if err != nil {
-			fmt.Printf("Error in step 6: %v\n", err)
-			return err
-		}
-		fmt.Println("Step 6 Completed")
-	}
-
 	return nil
 }
 
@@ -1840,12 +1465,12 @@ func containsStep(steps []int, step int) bool {
 
 func main() {
 	fmt.Println("===========================================")
-	fmt.Println("   Device Tracker - JSON + MongoDB Output")
+	fmt.Println("   Device Tracker - Parquet Output")
 	fmt.Println("===========================================")
 
 	startTime := time.Now()
 
-	runSteps := []int{3}
+	runSteps := []int{3, 5}
 
 	err := RunDeviceTracker(true, true, runSteps)
 	if err != nil {
