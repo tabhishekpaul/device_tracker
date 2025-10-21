@@ -273,10 +273,10 @@ func (dt *DeviceTracker) initParquetWriter(dateStr string) error {
 	schema := arrow.NewSchema(
 		[]arrow.Field{
 			{Name: "device_id", Type: arrow.BinaryTypes.String},
-			{Name: "event_timestamp", Type: arrow.FixedWidthTypes.Timestamp_us},
+			{Name: "event_timestamp", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
 			{Name: "latitude", Type: arrow.PrimitiveTypes.Float64},
 			{Name: "longitude", Type: arrow.PrimitiveTypes.Float64},
-			{Name: "load_date", Type: arrow.FixedWidthTypes.Timestamp_us},
+			{Name: "load_date", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
 		},
 		nil,
 	)
@@ -1470,7 +1470,7 @@ func main() {
 
 	startTime := time.Now()
 
-	runSteps := []int{5}
+	runSteps := []int{3, 5}
 
 	err := RunDeviceTracker(true, true, runSteps)
 	if err != nil {
