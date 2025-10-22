@@ -1285,7 +1285,7 @@ func RunDeviceTracker(runSteps []int) error {
 	}
 
 	if step3 {
-		err := dt.RunIdleDeviceSearch(folderList, GetLastNDatesFromYesterday(7))
+		err := dt.RunIdleDeviceSearch(folderList, dates)
 		if err != nil {
 			log.Fatal(err)
 		}
