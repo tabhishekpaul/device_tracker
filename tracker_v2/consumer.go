@@ -441,7 +441,7 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 				}
 			}
 
-			if idx, ok := colIndex["latitude"]; ok {
+			if idx, ok := colIndex["Latitude"]; ok {
 				switch col := rec.Column(idx).(type) {
 				case *array.Float64:
 					consumer.Latitude = col.Value(i)
@@ -450,7 +450,7 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 				}
 			}
 
-			if idx, ok := colIndex["longitude"]; ok {
+			if idx, ok := colIndex["Longitude"]; ok {
 				switch col := rec.Column(idx).(type) {
 				case *array.Float64:
 					consumer.Longitude = col.Value(i)
