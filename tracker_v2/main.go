@@ -33,16 +33,12 @@ import (
 
 const (
 	parquetBatchSize = 1000000
-	workerPoolSize   = 48  // All 48 cores
-	rowGroupWorkers  = 48  // Parallel row group processing
-	fileWorkers      = 16  // Parallel file processing
-	step3Workers     = 48  // Step 3 parallel workers
-	channelBuffer    = 100 // Buffered channels for throughput
+	workerPoolSize   = 48
+	rowGroupWorkers  = 48
+	fileWorkers      = 16
+	step3Workers     = 48
+	channelBuffer    = 100
 )
-
-// ============================================================================
-// TYPES (same as before)
-// ============================================================================
 
 type MongoConfig struct {
 	URI        string
@@ -101,7 +97,6 @@ type DeviceTracker struct {
 
 	NTFDC atomic.Int64
 
-	// Multiple parquet writers for parallel writing
 	parquetWriters     []*ParquetWriter
 	parquetWriterMutex sync.Mutex
 	numWriters         int
@@ -111,7 +106,6 @@ type DeviceTracker struct {
 	mongoConfig     MongoConfig
 }
 
-// ParquetWriter for concurrent writes
 type ParquetWriter struct {
 	mutex  sync.Mutex
 	batch  []TimeFilteredRecord
@@ -247,7 +241,6 @@ type FinalIdleDevicesOutput struct {
 	IdleDevicesByDate map[string][]IdleDeviceResult `json:"idle_devices_by_date"`
 }
 
-// Job structures for parallel processing
 type FileJob struct {
 	FilePath string
 	Index    int
@@ -283,7 +276,7 @@ func NewDeviceTracker(campaignAPIURL, outputFolder string, mongoConfig MongoConf
 		IdleDeviceBuffer: 10.0,
 		NumWorkers:       workerPoolSize,
 		mongoConfig:      mongoConfig,
-		numWriters:       8, // Multiple writers for parallelism
+		numWriters:       8,
 	}
 
 	dt.parseTimeFilters()
@@ -463,7 +456,6 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(folderPath string, ru
 
 		fmt.Printf("  📂 Processing %d files in parallel...\n", len(parquetFiles))
 
-		// Parallel file processing with worker pool
 		deviceMap := dt.processCampaignIntersectionParallel(parquetFiles)
 
 		err = dt.saveCampaignIntersectionJSON(deviceMap, dateStr)
@@ -499,13 +491,9 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(folderPath string, ru
 
 		fmt.Printf("  📂 Processing %d files with time+campaign filter...\n", len(parquetFiles))
 
-		// HYPER-PARALLEL: Process files in parallel
 		dt.processTimeFilteringParallel(parquetFiles, campaignDeviceSet)
 
 		dt.closeAllParquetWriters()
-
-		// Merge all temporary parquet files
-		dt.mergeParquetFiles(dateStr)
 
 		fmt.Printf("  ✅ Step 2: %d records filtered\n", dt.NTFDC.Load())
 	}
@@ -521,11 +509,9 @@ func (dt *DeviceTracker) processCampaignIntersectionParallel(parquetFiles []stri
 	deviceMap := make(map[string]map[string]MinimalDeviceRecord)
 	var mu sync.Mutex
 
-	// Job channel
 	jobs := make(chan FileJob, len(parquetFiles))
 	var wg sync.WaitGroup
 
-	// Spawn workers
 	for w := 0; w < fileWorkers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -551,7 +537,6 @@ func (dt *DeviceTracker) processCampaignIntersectionParallel(parquetFiles []stri
 		}(w)
 	}
 
-	// Send jobs
 	for i, fpath := range parquetFiles {
 		jobs <- FileJob{FilePath: fpath, Index: i}
 	}
@@ -573,12 +558,10 @@ func (dt *DeviceTracker) processFileForCampaignIntersection(parquetFile string) 
 
 	numRowGroups := pf.NumRowGroups()
 
-	// Process row groups in parallel
 	rgJobs := make(chan int, numRowGroups)
 	rgResults := make(chan []DeviceRecord, numRowGroups)
 	var rgWg sync.WaitGroup
 
-	// Spawn row group workers
 	for w := 0; w < rowGroupWorkers; w++ {
 		rgWg.Add(1)
 		go func() {
@@ -592,7 +575,6 @@ func (dt *DeviceTracker) processFileForCampaignIntersection(parquetFile string) 
 		}()
 	}
 
-	// Send row group jobs
 	go func() {
 		for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
 			rgJobs <- rgIdx
@@ -600,13 +582,11 @@ func (dt *DeviceTracker) processFileForCampaignIntersection(parquetFile string) 
 		close(rgJobs)
 	}()
 
-	// Collect results
 	go func() {
 		rgWg.Wait()
 		close(rgResults)
 	}()
 
-	// Process results
 	for records := range rgResults {
 		for _, record := range records {
 			point := orb.Point{record.Longitude, record.Latitude}
@@ -644,7 +624,6 @@ func (dt *DeviceTracker) processTimeFilteringParallel(parquetFiles []string, cam
 	jobs := make(chan FileJob, len(parquetFiles))
 	var wg sync.WaitGroup
 
-	// Spawn file workers
 	for w := 0; w < fileWorkers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -661,7 +640,6 @@ func (dt *DeviceTracker) processTimeFilteringParallel(parquetFiles []string, cam
 		}(w)
 	}
 
-	// Send jobs
 	for i, fpath := range parquetFiles {
 		jobs <- FileJob{FilePath: fpath, Index: i}
 	}
@@ -688,6 +666,11 @@ func (dt *DeviceTracker) processFileForTimeFiltering(parquetFile string, campaig
 		for i := range records {
 			record := &records[i]
 
+			// CRITICAL: Verify device_id is not empty
+			if record.DeviceID == "" {
+				continue
+			}
+
 			// Filter by campaign
 			if !campaignDeviceSet[record.DeviceID] {
 				continue
@@ -695,7 +678,6 @@ func (dt *DeviceTracker) processFileForTimeFiltering(parquetFile string, campaig
 
 			// Filter by time
 			if dt.isWithinTimeFilter(record.EventTimestamp) {
-				// Round-robin to different writers
 				writerIdx := workerID % dt.numWriters
 				dt.addToParquetWriter(writerIdx, TimeFilteredRecord{
 					DeviceID:       record.DeviceID,
@@ -712,7 +694,7 @@ func (dt *DeviceTracker) processFileForTimeFiltering(parquetFile string, campaig
 }
 
 // ============================================================================
-// MULTIPLE PARQUET WRITERS FOR PARALLEL WRITES
+// MULTIPLE PARQUET WRITERS - FIXED VERSION
 // ============================================================================
 
 func (dt *DeviceTracker) initParquetWriters(dateStr string) error {
@@ -726,11 +708,11 @@ func (dt *DeviceTracker) initParquetWriters(dateStr string) error {
 
 	schema := arrow.NewSchema(
 		[]arrow.Field{
-			{Name: "device_id", Type: arrow.BinaryTypes.String},
-			{Name: "event_timestamp", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
-			{Name: "latitude", Type: arrow.PrimitiveTypes.Float64},
-			{Name: "longitude", Type: arrow.PrimitiveTypes.Float64},
-			{Name: "load_date", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
+			{Name: "device_id", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "event_timestamp", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: false},
+			{Name: "latitude", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+			{Name: "longitude", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+			{Name: "load_date", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: false},
 		},
 		nil,
 	)
@@ -769,6 +751,12 @@ func (dt *DeviceTracker) initParquetWriters(dateStr string) error {
 }
 
 func (dt *DeviceTracker) addToParquetWriter(writerIdx int, record TimeFilteredRecord) {
+	// CRITICAL VALIDATION: Check device_id is not empty
+	if record.DeviceID == "" {
+		fmt.Printf("⚠️  WARNING: Attempting to write empty device_id\n")
+		return
+	}
+
 	pw := dt.parquetWriters[writerIdx]
 	pw.mutex.Lock()
 	defer pw.mutex.Unlock()
@@ -780,6 +768,7 @@ func (dt *DeviceTracker) addToParquetWriter(writerIdx int, record TimeFilteredRe
 	}
 }
 
+// CRITICAL FIX: Properly write string columns with validation
 func (dt *DeviceTracker) flushParquetWriter(pw *ParquetWriter) error {
 	if len(pw.batch) == 0 {
 		return nil
@@ -793,12 +782,27 @@ func (dt *DeviceTracker) flushParquetWriter(pw *ParquetWriter) error {
 	longitudeBuilder := array.NewFloat64Builder(pool)
 	loadDateBuilder := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"})
 
+	// CRITICAL: Validate and append each value
+	validCount := 0
 	for i := range pw.batch {
+		// Skip records with empty device_id
+		if pw.batch[i].DeviceID == "" {
+			fmt.Printf("⚠️  Skipping record with empty device_id\n")
+			continue
+		}
+
 		deviceIDBuilder.Append(pw.batch[i].DeviceID)
 		eventTimestampBuilder.Append(arrow.Timestamp(pw.batch[i].EventTimestamp.UnixMicro()))
 		latitudeBuilder.Append(pw.batch[i].Latitude)
 		longitudeBuilder.Append(pw.batch[i].Longitude)
 		loadDateBuilder.Append(arrow.Timestamp(pw.batch[i].LoadDate.UnixMicro()))
+		validCount++
+	}
+
+	if validCount == 0 {
+		fmt.Printf("⚠️  Writer %d: All records had empty device_id, skipping flush\n", pw.id)
+		pw.batch = pw.batch[:0]
+		return nil
 	}
 
 	deviceIDArray := deviceIDBuilder.NewArray()
@@ -816,12 +820,12 @@ func (dt *DeviceTracker) flushParquetWriter(pw *ParquetWriter) error {
 	record := array.NewRecord(
 		pw.schema,
 		[]arrow.Array{deviceIDArray, eventTimestampArray, latitudeArray, longitudeArray, loadDateArray},
-		int64(len(pw.batch)),
+		int64(validCount),
 	)
 	defer record.Release()
 
 	if err := pw.writer.Write(record); err != nil {
-		return err
+		return fmt.Errorf("failed to write parquet batch: %w", err)
 	}
 
 	pw.batch = pw.batch[:0]
@@ -843,46 +847,67 @@ func (dt *DeviceTracker) closeAllParquetWriters() {
 	}
 }
 
-func (dt *DeviceTracker) mergeParquetFiles(dateStr string) {
-	// In production, you'd merge all part files into one
-	// For now, Step 3 will read all part files
-	fmt.Printf("  💾 Generated %d parquet part files\n", dt.numWriters)
+// ============================================================================
+// STEP 3: HYPER-PARALLEL IDLE DEVICE DETECTION
+// ============================================================================
+
+func (dt *DeviceTracker) RunIdleDeviceSearch(folderList []string, targetDates []string) error {
+	fmt.Println("\n🚀 STEP 3: IDLE DEVICE DETECTION - FULL PARALLEL")
+
+	idleDevicesFolder := filepath.Join(dt.OutputFolder, "idle_devices")
+	os.MkdirAll(idleDevicesFolder, 0755)
+
+	fmt.Println("\n  📥 Loading campaign metadata from all dates...")
+	allCampaignMetadata, err := dt.GetUniqIdDataFrameForAllDates(targetDates)
+	if err != nil {
+		return fmt.Errorf("failed to load metadata: %w", err)
+	}
+
+	campaignDeviceSet := make(map[string]bool, len(allCampaignMetadata))
+	for deviceID := range allCampaignMetadata {
+		campaignDeviceSet[deviceID] = true
+	}
+
+	for _, targetDate := range targetDates {
+		fmt.Printf("\n🔍 Date: %s [%d WORKERS]\n", targetDate, step3Workers)
+		err := dt.FindIdleDevicesHyperParallelFixed(folderList, targetDate, allCampaignMetadata, campaignDeviceSet)
+		if err != nil {
+			fmt.Printf("  ⚠️  Error: %v\n", err)
+			continue
+		}
+		runtime.GC()
+	}
+
+	dt.MergeIdleDevicesByEventDate()
+	return nil
 }
 
-func (dt *DeviceTracker) FindIdleDevicesHyperParallel(folderList []string, targetDate string) error {
-	campaignMetadata, err := dt.GetUniqIdDataFrame()
+func (dt *DeviceTracker) FindIdleDevicesHyperParallelFixed(
+	folderList []string,
+	targetDate string,
+	campaignMetadata map[string]CampaignMetadata,
+	campaignDeviceSet map[string]bool,
+) error {
+
+	dateStr := strings.ReplaceAll(targetDate, "-", "")
+	timeFilteredFolder := filepath.Join(dt.OutputFolder, "time_filtered", dateStr)
+	pattern := filepath.Join(timeFilteredFolder, "*.parquet")
+
+	allParquetFiles, err := filepath.Glob(pattern)
 	if err != nil {
 		return err
 	}
 
-	campaignDeviceSet := make(map[string]bool, len(campaignMetadata))
-	for deviceID := range campaignMetadata {
-		campaignDeviceSet[deviceID] = true
-	}
-
-	fmt.Printf("  📋 %d campaign devices\n", len(campaignMetadata))
-
-	// Collect all parquet files (including part files)
-	var allParquetFiles []string
-	for _, folderName := range folderList {
-		timeFilteredFolder := filepath.Join(dt.OutputFolder, "time_filtered", strings.TrimPrefix(folderName, "load_date="))
-		pattern := filepath.Join(timeFilteredFolder, "*.parquet")
-		files, _ := filepath.Glob(pattern)
-		allParquetFiles = append(allParquetFiles, files...)
-	}
-
 	if len(allParquetFiles) == 0 {
-		fmt.Printf("  ⚠️  No time-filtered files found\n")
+		fmt.Printf("  ⚠️  No files in %s\n", timeFilteredFolder)
 		return nil
 	}
 
-	fmt.Printf("  📂 Processing %d parquet files in parallel\n", len(allParquetFiles))
+	fmt.Printf("  📂 Processing %d files\n", len(allParquetFiles))
 
-	// Shared device states (with mutex)
 	deviceStates := make(map[string]*DeviceTrackingState)
 	var statesMutex sync.Mutex
 
-	// Parallel file processing
 	jobs := make(chan string, len(allParquetFiles))
 	var wg sync.WaitGroup
 
@@ -894,14 +919,12 @@ func (dt *DeviceTracker) FindIdleDevicesHyperParallel(folderList []string, targe
 			for parquetPath := range jobs {
 				localStates := dt.processParquetForIdleDevices(parquetPath, campaignDeviceSet)
 
-				// Merge local states into global
 				statesMutex.Lock()
 				for deviceID, localState := range localStates {
 					globalState, exists := deviceStates[deviceID]
 					if !exists {
 						deviceStates[deviceID] = localState
 					} else {
-						// Merge: check if still idle
 						if globalState.IsStillIdle && localState.IsStillIdle {
 							distance := geo.Distance(globalState.FirstPoint, localState.FirstPoint)
 							if distance > dt.IdleDeviceBuffer {
@@ -916,7 +939,6 @@ func (dt *DeviceTracker) FindIdleDevicesHyperParallel(folderList []string, targe
 		}(w)
 	}
 
-	// Send jobs
 	for _, fpath := range allParquetFiles {
 		jobs <- fpath
 	}
@@ -953,6 +975,11 @@ func (dt *DeviceTracker) processParquetForIdleDevices(parquetPath string, campai
 			record := &records[i]
 			deviceID := record.DeviceID
 
+			// Skip empty device IDs
+			if deviceID == "" {
+				continue
+			}
+
 			if !campaignDeviceSet[deviceID] {
 				continue
 			}
@@ -984,7 +1011,7 @@ func (dt *DeviceTracker) processParquetForIdleDevices(parquetPath string, campai
 }
 
 // ============================================================================
-// REMAINING METHODS (same as before, truncated for space)
+// REMAINING METHODS
 // ============================================================================
 
 func (dt *DeviceTracker) isWithinTimeFilter(eventTime time.Time) bool {
@@ -1029,6 +1056,89 @@ func (dt *DeviceTracker) loadCampaignDeviceSetFromJSON(dateStr string) (map[stri
 	}
 
 	return deviceSet, nil
+}
+
+func (dt *DeviceTracker) GetUniqIdDataFrameForDate(dateStr string) (map[string]CampaignMetadata, error) {
+	jsonPath := filepath.Join(dt.OutputFolder, "campaign_intersection", dateStr,
+		fmt.Sprintf("campaign_devices_%s.json", dateStr))
+
+	if _, err := os.Stat(jsonPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("campaign JSON not found: %s", jsonPath)
+	}
+
+	file, err := os.Open(jsonPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var campaignOutput CampaignIntersectionOutput
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&campaignOutput); err != nil {
+		return nil, err
+	}
+
+	metadata := make(map[string]CampaignMetadata, 100000)
+
+	for _, campaign := range campaignOutput.Campaigns {
+		for _, poi := range campaign.POIs {
+			for _, device := range poi.Devices {
+				deviceID := device.DeviceID
+
+				if _, exists := metadata[deviceID]; exists {
+					continue
+				}
+
+				metadata[deviceID] = CampaignMetadata{
+					DeviceID:       deviceID,
+					EventTimestamp: device.EventTimestamp,
+					Address:        poi.POIName,
+					Campaign:       campaign.CampaignName,
+					CampaignID:     campaign.CampaignID,
+					POIID:          poi.POIID,
+				}
+			}
+		}
+	}
+
+	return metadata, nil
+}
+
+func (dt *DeviceTracker) GetUniqIdDataFrameForAllDates(dates []string) (map[string]CampaignMetadata, error) {
+	allMetadata := make(map[string]CampaignMetadata, 500000)
+	loadedDates := 0
+
+	for _, date := range dates {
+		dateStr := strings.ReplaceAll(date, "-", "")
+
+		metadata, err := dt.GetUniqIdDataFrameForDate(dateStr)
+		if err != nil {
+			fmt.Printf("    ⚠️  Skip %s: %v\n", date, err)
+			continue
+		}
+
+		for deviceID, meta := range metadata {
+			if _, exists := allMetadata[deviceID]; !exists {
+				allMetadata[deviceID] = meta
+			}
+		}
+
+		loadedDates++
+		fmt.Printf("    ✓ Loaded %d devices from %s\n", len(metadata), date)
+	}
+
+	if len(allMetadata) == 0 {
+		return nil, fmt.Errorf("no metadata found")
+	}
+
+	fmt.Printf("  📋 Total unique campaign devices across %d dates: %d\n", loadedDates, len(allMetadata))
+	return allMetadata, nil
+}
+
+func (dt *DeviceTracker) GetUniqIdDataFrame() (map[string]CampaignMetadata, error) {
+	yesterday := time.Now().AddDate(0, 0, -1)
+	dateStr := yesterday.Format("20060102")
+	return dt.GetUniqIdDataFrameForDate(dateStr)
 }
 
 func (dt *DeviceTracker) saveCampaignIntersectionJSON(deviceMap map[string]map[string]MinimalDeviceRecord, dateStr string) error {
@@ -1269,213 +1379,6 @@ func (dt *DeviceTracker) MergeIdleDevicesByEventDate() error {
 	encoder.Encode(finalOutput)
 
 	fmt.Printf("\n💾 Final: %d idle devices across %d dates\n", totalDevices, len(processedDates))
-	return nil
-}
-
-func (dt *DeviceTracker) GetUniqIdDataFrameForDate(dateStr string) (map[string]CampaignMetadata, error) {
-	jsonPath := filepath.Join(dt.OutputFolder, "campaign_intersection", dateStr,
-		fmt.Sprintf("campaign_devices_%s.json", dateStr))
-
-	if _, err := os.Stat(jsonPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("campaign JSON not found: %s", jsonPath)
-	}
-
-	file, err := os.Open(jsonPath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var campaignOutput CampaignIntersectionOutput
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&campaignOutput); err != nil {
-		return nil, err
-	}
-
-	metadata := make(map[string]CampaignMetadata, 100000)
-
-	for _, campaign := range campaignOutput.Campaigns {
-		for _, poi := range campaign.POIs {
-			for _, device := range poi.Devices {
-				deviceID := device.DeviceID
-
-				if _, exists := metadata[deviceID]; exists {
-					continue
-				}
-
-				metadata[deviceID] = CampaignMetadata{
-					DeviceID:       deviceID,
-					EventTimestamp: device.EventTimestamp,
-					Address:        poi.POIName,
-					Campaign:       campaign.CampaignName,
-					CampaignID:     campaign.CampaignID,
-					POIID:          poi.POIID,
-				}
-			}
-		}
-	}
-
-	return metadata, nil
-}
-
-// 2. Load metadata from ALL dates (union of all campaign devices)
-func (dt *DeviceTracker) GetUniqIdDataFrameForAllDates(dates []string) (map[string]CampaignMetadata, error) {
-	allMetadata := make(map[string]CampaignMetadata, 500000)
-	loadedDates := 0
-
-	for _, date := range dates {
-		// Convert "2025-10-21" to "20251021"
-		dateStr := strings.ReplaceAll(date, "-", "")
-
-		metadata, err := dt.GetUniqIdDataFrameForDate(dateStr)
-		if err != nil {
-			fmt.Printf("    ⚠️  Skipping %s: %v\n", date, err)
-			continue
-		}
-
-		// Merge metadata (keep first occurrence)
-		for deviceID, meta := range metadata {
-			if _, exists := allMetadata[deviceID]; !exists {
-				allMetadata[deviceID] = meta
-			}
-		}
-
-		loadedDates++
-		fmt.Printf("    ✓ Loaded %d devices from %s\n", len(metadata), date)
-	}
-
-	if len(allMetadata) == 0 {
-		return nil, fmt.Errorf("no campaign metadata found for any date")
-	}
-
-	fmt.Printf("  📋 Total unique campaign devices across %d dates: %d\n", loadedDates, len(allMetadata))
-	return allMetadata, nil
-}
-
-// 3. Keep old function for backward compatibility
-func (dt *DeviceTracker) GetUniqIdDataFrame() (map[string]CampaignMetadata, error) {
-	yesterday := time.Now().AddDate(0, 0, -1)
-	dateStr := yesterday.Format("20060102")
-	return dt.GetUniqIdDataFrameForDate(dateStr)
-}
-
-// ============================================================================
-// 4. FIX: Update RunIdleDeviceSearch to load ALL dates
-// ============================================================================
-
-func (dt *DeviceTracker) RunIdleDeviceSearch(folderList []string, targetDates []string) error {
-	fmt.Println("\n🚀 STEP 3: IDLE DEVICE DETECTION - FULL PARALLEL")
-
-	idleDevicesFolder := filepath.Join(dt.OutputFolder, "idle_devices")
-	os.MkdirAll(idleDevicesFolder, 0755)
-
-	// CRITICAL FIX: Load campaign metadata from ALL dates
-	fmt.Println("\n  📥 Loading campaign metadata from all dates...")
-	allCampaignMetadata, err := dt.GetUniqIdDataFrameForAllDates(targetDates)
-	if err != nil {
-		return fmt.Errorf("failed to load campaign metadata: %w", err)
-	}
-
-	// Create device set for fast lookup
-	campaignDeviceSet := make(map[string]bool, len(allCampaignMetadata))
-	for deviceID := range allCampaignMetadata {
-		campaignDeviceSet[deviceID] = true
-	}
-
-	// Process each date
-	for _, targetDate := range targetDates {
-		fmt.Printf("\n🔍 Date: %s [%d WORKERS]\n", targetDate, step3Workers)
-		err := dt.FindIdleDevicesHyperParallelFixed(folderList, targetDate, allCampaignMetadata, campaignDeviceSet)
-		if err != nil {
-			fmt.Printf("  ⚠️  Error: %v\n", err)
-			continue
-		}
-		runtime.GC()
-	}
-
-	dt.MergeIdleDevicesByEventDate()
-	return nil
-}
-
-// ============================================================================
-// 5. FIX: Update FindIdleDevicesHyperParallel to use passed metadata
-// ============================================================================
-
-func (dt *DeviceTracker) FindIdleDevicesHyperParallelFixed(
-	folderList []string,
-	targetDate string,
-	campaignMetadata map[string]CampaignMetadata,
-	campaignDeviceSet map[string]bool,
-) error {
-
-	// Collect all parquet files for this specific date
-	dateStr := strings.ReplaceAll(targetDate, "-", "")
-	timeFilteredFolder := filepath.Join(dt.OutputFolder, "time_filtered", dateStr)
-	pattern := filepath.Join(timeFilteredFolder, "*.parquet")
-
-	allParquetFiles, err := filepath.Glob(pattern)
-	if err != nil {
-		return err
-	}
-
-	if len(allParquetFiles) == 0 {
-		fmt.Printf("  ⚠️  No time-filtered files found in %s\n", timeFilteredFolder)
-		return nil
-	}
-
-	fmt.Printf("  📂 Processing %d parquet files\n", len(allParquetFiles))
-
-	// Shared device states (with mutex)
-	deviceStates := make(map[string]*DeviceTrackingState)
-	var statesMutex sync.Mutex
-
-	// Parallel file processing
-	jobs := make(chan string, len(allParquetFiles))
-	var wg sync.WaitGroup
-
-	for w := 0; w < step3Workers; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			for parquetPath := range jobs {
-				localStates := dt.processParquetForIdleDevices(parquetPath, campaignDeviceSet)
-
-				// Merge local states into global
-				statesMutex.Lock()
-				for deviceID, localState := range localStates {
-					globalState, exists := deviceStates[deviceID]
-					if !exists {
-						deviceStates[deviceID] = localState
-					} else {
-						// Merge: check if still idle
-						if globalState.IsStillIdle && localState.IsStillIdle {
-							distance := geo.Distance(globalState.FirstPoint, localState.FirstPoint)
-							if distance > dt.IdleDeviceBuffer {
-								globalState.IsStillIdle = false
-							}
-						}
-						globalState.RecordCount += localState.RecordCount
-					}
-				}
-				statesMutex.Unlock()
-			}
-		}(w)
-	}
-
-	// Send jobs
-	for _, fpath := range allParquetFiles {
-		jobs <- fpath
-	}
-	close(jobs)
-
-	wg.Wait()
-
-	fmt.Printf("  ✅ Analyzed %d devices\n", len(deviceStates))
-
-	idleCount := dt.saveIdleDevicesFromStates(deviceStates, campaignMetadata)
-	fmt.Printf("  💾 Saved %d idle devices\n", idleCount)
-
 	return nil
 }
 
@@ -1803,11 +1706,14 @@ func main() {
 	fmt.Println("╔═══════════════════════════════════════════════════════╗")
 	fmt.Println("║     DEVICE TRACKER - HYPER-PARALLEL EDITION          ║")
 	fmt.Println("║     48 CORES | 386GB RAM | 2000%+ CPU TARGET         ║")
+	fmt.Println("║     FIXED: Proper Parquet String Writing            ║")
 	fmt.Println("╚═══════════════════════════════════════════════════════╝")
 
 	startTime := time.Now()
 
-	runSteps := []int{3} // Change to []int{3} for idle detection
+	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
+	// The existing files have NULL device_ids and cannot be fixed
+	runSteps := []int{1, 2} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
