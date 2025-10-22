@@ -107,12 +107,13 @@ type DeviceTracker struct {
 }
 
 type LocationRecord struct {
-	Address    string      `json:"address"`
-	Campaign   string      `json:"campaign"`
-	CampaignID string      `json:"campaign_id"`
-	POIID      string      `json:"poi_id"`
-	Geometry   orb.Polygon `json:"-"`
-	Bounds     orb.Bound   `json:"-"`
+	Address    string                `json:"address"`
+	Campaign   string                `json:"campaign"`
+	CampaignID string                `json:"campaign_id"`
+	POIID      string                `json:"poi_id"`
+	Geometry   orb.Polygon           `json:"-"`
+	Bounds     orb.Bound             `json:"-"`
+	Devices    []MinimalDeviceRecord `bson:"devices"`
 }
 
 type DeviceRecord struct {
@@ -751,14 +752,6 @@ func (dt *DeviceTracker) fetchCampaignsFromAPI() error {
 func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string, step1 bool, step2 bool) error {
 	startTime := time.Now()
 
-	if step1 {
-		if err := dt.fetchCampaignsFromAPI(); err != nil {
-			return fmt.Errorf("failed to fetch campaigns from API: %w", err)
-		}
-
-		dt.buildSpatialIndex()
-	}
-
 	var fileList []string
 
 	patterns := []string{
@@ -1259,6 +1252,15 @@ func RunDeviceTracker(runSteps []int) error {
 
 	step1 := containsStep(runSteps, 1)
 	step2 := containsStep(runSteps, 2)
+	step3 := containsStep(runSteps, 3)
+
+	if step1 || step3 {
+		if err := dt.fetchCampaignsFromAPI(); err != nil {
+			return fmt.Errorf("failed to fetch campaigns from API: %w", err)
+		}
+
+		dt.buildSpatialIndex()
+	}
 
 	if step1 || step2 {
 		runningSteps := ""
@@ -1281,8 +1283,6 @@ func RunDeviceTracker(runSteps []int) error {
 
 		fmt.Printf("\n%s Completed", runningSteps)
 	}
-
-	step3 := containsStep(runSteps, 3)
 
 	if step3 {
 		err := dt.RunIdleDeviceSearch(folderList, GetLastNDatesFromYesterday(7))

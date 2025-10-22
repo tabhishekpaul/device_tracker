@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,7 +17,7 @@ import (
 )
 
 // ============================================================================
-// STEP 3: IDLE DEVICE DETECTION - OPTIMIZED FOR PERFORMANCE
+// STEP 3: IDLE DEVICE DETECTION - COMPLETE IMPLEMENTATION
 // ============================================================================
 
 // CampaignMetadata holds the campaign info for a device
@@ -75,7 +76,7 @@ func (dt *DeviceTracker) RunIdleDeviceSearch(folderList []string, targetDates []
 
 // FindIdleDevices processes time-filtered parquet files for a specific target date
 func (dt *DeviceTracker) FindIdleDevices(folderList []string, targetDate string) error {
-	// Load campaign metadata
+	// Load campaign metadata from JSON
 	campaignMetadata, err := dt.GetUniqIdDataFrame()
 	if err != nil {
 		return fmt.Errorf("failed to get unique ID dataframe: %w", err)
@@ -195,67 +196,90 @@ func (dt *DeviceTracker) MergeIdleDevicesOutput(targetDates []string) error {
 }
 
 // ============================================================================
-// OPTIMIZED HELPER METHODS
+// JSON METADATA LOADING (FROM STEP 1 OUTPUT)
 // ============================================================================
 
-// GetUniqIdDataFrame loads unique device metadata (optimized with minimal allocations)
+// GetUniqIdDataFrame loads unique device metadata from JSON file for specific target date
 func (dt *DeviceTracker) GetUniqIdDataFrame() (map[string]CampaignMetadata, error) {
-	csvPath := filepath.Join(dt.OutputFolder, "Devices_Within_Campaign.csv")
+	// Get yesterday's date (the target date we're processing)
+	yesterday := time.Now().AddDate(0, 0, -1)
+	dateStr := yesterday.Format("20060102") // Format: YYYYMMDD (e.g., 20251021)
 
-	if _, err := os.Stat(csvPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("campaign devices CSV not found: %s", csvPath)
+	// Build JSON file path: campaign_intersection_20251021.json
+	jsonPath := filepath.Join(dt.OutputFolder, fmt.Sprintf("campaign_intersection_%s.json", dateStr))
+
+	fmt.Printf("  📄 Reading campaign metadata from: %s\n", jsonPath)
+
+	// Check if file exists
+	if _, err := os.Stat(jsonPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("campaign intersection JSON not found: %s (make sure Step 1 ran for this date)", jsonPath)
 	}
 
-	file, err := os.Open(csvPath)
+	// Load and parse JSON
+	return dt.loadMetadataFromJSON(jsonPath)
+}
+
+// loadMetadataFromJSON reads the CampaignIntersectionOutput JSON and extracts device metadata
+func (dt *DeviceTracker) loadMetadataFromJSON(jsonPath string) (map[string]CampaignMetadata, error) {
+	startTime := time.Now()
+
+	// Open JSON file
+	file, err := os.Open(jsonPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open JSON file: %w", err)
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
-	reader.ReuseRecord = true // OPTIMIZATION: Reuse record slice
-
-	// Read header
-	header, err := reader.Read()
-	if err != nil {
-		return nil, err
+	// Parse JSON into CampaignIntersectionOutput structure
+	var campaignOutput CampaignIntersectionOutput
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&campaignOutput); err != nil {
+		return nil, fmt.Errorf("failed to decode JSON: %w", err)
 	}
 
-	// Find column indices
-	colIndices := make(map[string]int)
-	for i, col := range header {
-		colIndices[col] = i
+	// Extract metadata from nested structure: Campaigns -> POIs -> Devices
+	metadata := make(map[string]CampaignMetadata, 100000)
+
+	// Iterate through all campaigns
+	for _, campaign := range campaignOutput.Campaigns {
+		// Iterate through all POIs in this campaign
+		for _, poi := range campaign.POIs {
+			// Iterate through all devices in this POI
+			for _, device := range poi.Devices {
+				deviceID := device.DeviceID
+
+				// Only keep first occurrence of each device (deduplication)
+				if _, exists := metadata[deviceID]; exists {
+					continue
+				}
+
+				// Create metadata entry with campaign, POI, and device info
+				metadata[deviceID] = CampaignMetadata{
+					DeviceID:       deviceID,
+					EventTimestamp: device.EventTimestamp,
+					Address:        poi.POIName, // POI name as address
+					Campaign:       campaign.CampaignName,
+					CampaignID:     campaign.CampaignID,
+					POIID:          poi.POIID,
+				}
+			}
+		}
 	}
 
-	metadata := make(map[string]CampaignMetadata, 100000) // Pre-allocate
+	duration := time.Since(startTime)
+	fmt.Printf("  ✅ Loaded metadata for %d unique devices from JSON in %v\n", len(metadata), duration)
 
-	for {
-		record, err := reader.Read()
-		if err != nil {
-			break
-		}
-
-		deviceID := record[colIndices["device_id"]]
-
-		// Only keep first occurrence
-		if _, exists := metadata[deviceID]; exists {
-			continue
-		}
-
-		timestamp, _ := time.Parse(time.RFC3339, record[colIndices["event_timestamp"]])
-
-		metadata[deviceID] = CampaignMetadata{
-			DeviceID:       deviceID,
-			EventTimestamp: timestamp,
-			Address:        record[colIndices["address"]],
-			Campaign:       record[colIndices["campaign"]],
-			CampaignID:     record[colIndices["campaign_id"]],
-			POIID:          record[colIndices["poi_id"]],
-		}
+	// Validate we got data
+	if len(metadata) == 0 {
+		return nil, fmt.Errorf("no device metadata found in JSON file - JSON might be empty or malformed")
 	}
 
 	return metadata, nil
 }
+
+// ============================================================================
+// PARQUET LOADING METHODS
+// ============================================================================
 
 // loadTimeFilteredParquets loads parquet files in parallel
 func (dt *DeviceTracker) loadTimeFilteredParquets(folderList []string, targetDate string) ([]DeviceRecord, []string) {
@@ -335,6 +359,10 @@ func (dt *DeviceTracker) readTimeFilteredParquet(filePath string) ([]DeviceRecor
 
 	return records, nil
 }
+
+// ============================================================================
+// DEVICE GROUPING AND PROCESSING
+// ============================================================================
 
 // groupByDeviceIDOptimized groups records with pre-allocated map
 func (dt *DeviceTracker) groupByDeviceIDOptimized(records []DeviceRecord) map[string][]DeviceRecord {
