@@ -10,7 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +24,7 @@ import (
 	"github.com/apache/arrow/go/v14/parquet/file"
 	"github.com/apache/arrow/go/v14/parquet/pqarrow"
 	"github.com/paulmach/orb"
+	"github.com/paulmach/orb/geo"
 	"github.com/paulmach/orb/planar"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -31,7 +32,6 @@ import (
 )
 
 const (
-	workerPoolSize   = 20
 	parquetBatchSize = 1000000
 )
 
@@ -128,7 +128,7 @@ type DeviceRecord struct {
 	POIID          string    `json:"poi_id,omitempty"`
 }
 
-// Minimal device record for JSON output (removes redundant fields)
+// Minimal device record for JSON output
 type MinimalDeviceRecord struct {
 	DeviceID       string    `json:"device_id" bson:"device_id"`
 	EventTimestamp time.Time `json:"event_timestamp" bson:"event_timestamp"`
@@ -157,7 +157,7 @@ type CampaignDevices struct {
 	TotalDevices int          `json:"total_devices"`
 }
 
-// MongoDB document structure - each POI as separate document
+// MongoDB document structure
 type POIMongoDocument struct {
 	ID            primitive.ObjectID    `bson:"_id,omitempty"`
 	POIID         primitive.ObjectID    `bson:"poi_id"`
@@ -195,43 +195,522 @@ type TimeFilterOutput struct {
 	ProcessingTimeMs  int64  `json:"processing_time_ms"`
 }
 
-func (dt *DeviceTracker) readTimestampColumn(rg *file.RowGroupReader, colIdx int, numRows int) []time.Time {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("Panic reading timestamp column: %v\n", r)
-		}
-	}()
+// Step 3 structures
+type CampaignMetadata struct {
+	DeviceID       string    `json:"device_id"`
+	EventTimestamp time.Time `json:"event_timestamp"`
+	Address        string    `json:"address"`
+	Campaign       string    `json:"campaign"`
+	CampaignID     string    `json:"campaign_id"`
+	POIID          string    `json:"poi_id"`
+}
 
-	col, err := rg.Column(colIdx)
-	if err != nil {
-		return make([]time.Time, 0)
+type IdleDeviceResult struct {
+	DeviceID    string `json:"device_id"`
+	VisitedTime string `json:"visited_time"`
+	Address     string `json:"address"`
+	Campaign    string `json:"campaign"`
+	CampaignID  string `json:"campaign_id"`
+	POIID       string `json:"poi_id"`
+	Geometry    string `json:"geometry"`
+}
+
+type DeviceTrackingState struct {
+	FirstPoint  orb.Point
+	FirstTime   time.Time
+	IsStillIdle bool
+	RecordCount int
+}
+
+type IdleDevicesByDate struct {
+	EventDate        string             `json:"event_date"`
+	TotalIdleDevices int                `json:"total_idle_devices"`
+	IdleDevices      []IdleDeviceResult `json:"idle_devices"`
+}
+
+type FinalIdleDevicesOutput struct {
+	ProcessedDates    []string                      `json:"processed_dates"`
+	TotalIdleDevices  int                           `json:"total_idle_devices"`
+	ProcessingTimeMs  int64                         `json:"processing_time_ms"`
+	IdleDevicesByDate map[string][]IdleDeviceResult `json:"idle_devices_by_date"`
+}
+
+// ============================================================================
+// CONSTRUCTOR
+// ============================================================================
+
+func NewDeviceTracker(campaignAPIURL, outputFolder string, mongoConfig MongoConfig) (*DeviceTracker, error) {
+	ctx := context.Background()
+
+	dt := &DeviceTracker{
+		ctx:              ctx,
+		FilterInTime:     "02:00:00",
+		FilterOutTime:    "04:30:00",
+		TimeColumnName:   "event_timestamp",
+		DeviceIDColumn:   "device_id",
+		LatColumn:        "latitude",
+		LonColumn:        "longitude",
+		CampaignAPIURL:   campaignAPIURL,
+		OutputFolder:     outputFolder,
+		IdleDeviceBuffer: 10.0,
+		NumWorkers:       8,
+		mongoConfig:      mongoConfig,
 	}
 
-	result := make([]time.Time, 0, numRows)
+	// Parse time filters
+	dt.parseTimeFilters()
 
-	switch reader := col.(type) {
-	case *file.Int64ColumnChunkReader:
-		values := make([]int64, 8192)
-		defLevels := make([]int16, 8192)
+	// Connect to MongoDB
+	if err := dt.connectMongoDB(); err != nil {
+		return nil, err
+	}
 
-		for {
-			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
-			if n == 0 {
-				break
+	return dt, nil
+}
+
+func (dt *DeviceTracker) parseTimeFilters() {
+	fmt.Sscanf(dt.FilterInTime, "%d:%d:%d", &dt.filterStartHour, &dt.filterStartMin, &dt.filterStartSec)
+	fmt.Sscanf(dt.FilterOutTime, "%d:%d:%d", &dt.filterEndHour, &dt.filterEndMin, &dt.filterEndSec)
+
+	dt.startSeconds = dt.filterStartHour*3600 + dt.filterStartMin*60 + dt.filterStartSec
+	dt.endSeconds = dt.filterEndHour*3600 + dt.filterEndMin*60 + dt.filterEndSec
+
+	fmt.Printf("Time filter configured: %s to %s\n", dt.FilterInTime, dt.FilterOutTime)
+}
+
+func (dt *DeviceTracker) connectMongoDB() error {
+	clientOptions := options.Client().ApplyURI(dt.mongoConfig.URI)
+	client, err := mongo.Connect(dt.ctx, clientOptions)
+	if err != nil {
+		return fmt.Errorf("failed to connect to MongoDB: %w", err)
+	}
+
+	if err := client.Ping(dt.ctx, nil); err != nil {
+		return fmt.Errorf("failed to ping MongoDB: %w", err)
+	}
+
+	dt.mongoClient = client
+	dt.mongoCollection = client.Database(dt.mongoConfig.Database).Collection(dt.mongoConfig.Collection)
+
+	fmt.Println("✅ Successfully connected to MongoDB")
+	return nil
+}
+
+func (dt *DeviceTracker) Close() {
+	if dt.mongoClient != nil {
+		dt.mongoClient.Disconnect(dt.ctx)
+	}
+}
+
+// ============================================================================
+// API FETCHING
+// ============================================================================
+
+func (dt *DeviceTracker) fetchCampaignsFromAPI() error {
+	fmt.Printf("Fetching campaigns from API: %s\n", dt.CampaignAPIURL)
+
+	resp, err := http.Get(dt.CampaignAPIURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch campaigns: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return fmt.Errorf("failed to parse JSON: %w", err)
+	}
+
+	if !apiResp.Success {
+		return fmt.Errorf("API returned error: %s", apiResp.Message)
+	}
+
+	dt.LocDataMutex.Lock()
+	defer dt.LocDataMutex.Unlock()
+
+	dt.LocData = make([]LocationRecord, 0)
+
+	for _, campaign := range apiResp.Data {
+		for _, poi := range campaign.POIs {
+			if len(poi.Polygon) == 0 {
+				continue
 			}
-			for i := 0; i < int(n); i++ {
-				if defLevels[i] > 0 {
-					t := time.Unix(0, values[i]*1000).UTC()
-					result = append(result, t)
-				} else {
-					result = append(result, time.Time{})
+
+			ring := make(orb.Ring, 0, len(poi.Polygon))
+			for _, coord := range poi.Polygon {
+				if len(coord) >= 2 {
+					ring = append(ring, orb.Point{coord[0], coord[1]})
 				}
 			}
+
+			if len(ring) > 0 && !ring[0].Equal(ring[len(ring)-1]) {
+				ring = append(ring, ring[0])
+			}
+
+			polygon := orb.Polygon{ring}
+			bounds := polygon.Bound()
+
+			dt.LocData = append(dt.LocData, LocationRecord{
+				Address:    poi.Name,
+				Campaign:   campaign.Name,
+				CampaignID: campaign.ID,
+				POIID:      poi.ID,
+				Geometry:   polygon,
+				Bounds:     bounds,
+			})
 		}
 	}
 
-	return result
+	fmt.Printf("Loaded %d location records from API (%d campaigns)\n", len(dt.LocData), len(apiResp.Data))
+	return nil
 }
+
+// ============================================================================
+// SPATIAL INDEX
+// ============================================================================
+
+func (dt *DeviceTracker) buildSpatialIndex() {
+	dt.spatialIndex = make(map[int][]int)
+
+	const gridSize = 0.01
+
+	for i, loc := range dt.LocData {
+		minX := int(loc.Bounds.Min[0] / gridSize)
+		maxX := int(loc.Bounds.Max[0] / gridSize)
+		minY := int(loc.Bounds.Min[1] / gridSize)
+		maxY := int(loc.Bounds.Max[1] / gridSize)
+
+		for x := minX; x <= maxX; x++ {
+			for y := minY; y <= maxY; y++ {
+				cellKey := x*10000 + y
+				dt.spatialIndex[cellKey] = append(dt.spatialIndex[cellKey], i)
+			}
+		}
+	}
+
+	fmt.Printf("Built spatial index with %d cells\n", len(dt.spatialIndex))
+}
+
+func (dt *DeviceTracker) findIntersectingLocations(point orb.Point) []int {
+	const gridSize = 0.01
+	cellX := int(point[0] / gridSize)
+	cellY := int(point[1] / gridSize)
+	cellKey := cellX*10000 + cellY
+
+	candidates, exists := dt.spatialIndex[cellKey]
+	if !exists {
+		return nil
+	}
+
+	results := make([]int, 0)
+	for _, idx := range candidates {
+		loc := dt.LocData[idx]
+		if planar.PolygonContains(loc.Geometry, point) {
+			results = append(results, idx)
+		}
+	}
+
+	return results
+}
+
+// ============================================================================
+// STEP 1: CAMPAIGN INTERSECTION
+// ============================================================================
+
+func (dt *DeviceTracker) FindCampaignIntersectionForFolder(folderPath string, runStep1, runStep2 bool) error {
+	dateStr := dt.extractDateFromPath(folderPath)
+	if dateStr == "" {
+		return fmt.Errorf("could not extract date from path: %s", folderPath)
+	}
+
+	// STEP 1: Campaign Intersection
+	if runStep1 {
+		fmt.Printf("\n🔍 STEP 1: Campaign Intersection for %s\n", dateStr)
+
+		parquetFiles, err := filepath.Glob(filepath.Join(folderPath, "*.parquet"))
+		if err != nil {
+			return fmt.Errorf("failed to find parquet files: %w", err)
+		}
+
+		fmt.Printf("  📂 Found %d parquet files\n", len(parquetFiles))
+
+		deviceMap := make(map[string]map[string]MinimalDeviceRecord)
+		var mu sync.Mutex
+
+		for idx, parquetFile := range parquetFiles {
+			if idx%10 == 0 {
+				fmt.Printf("    🔄 Processing file %d/%d...\n", idx+1, len(parquetFiles))
+			}
+
+			pf, err := file.OpenParquetFile(parquetFile, false)
+			if err != nil {
+				continue
+			}
+
+			numRowGroups := pf.NumRowGroups()
+			for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
+				records, err := dt.readRowGroup(pf, rgIdx)
+				if err != nil {
+					continue
+				}
+
+				for _, record := range records {
+					point := orb.Point{record.Longitude, record.Latitude}
+					locIndices := dt.findIntersectingLocations(point)
+
+					if len(locIndices) > 0 {
+						mu.Lock()
+						for _, locIdx := range locIndices {
+							loc := dt.LocData[locIdx]
+							key := fmt.Sprintf("%s_%s_%s", loc.CampaignID, loc.POIID, record.DeviceID)
+
+							if _, exists := deviceMap[key]; !exists {
+								deviceMap[key] = map[string]MinimalDeviceRecord{
+									"device": {
+										DeviceID:       record.DeviceID,
+										EventTimestamp: record.EventTimestamp,
+									},
+									"loc": {
+										DeviceID: fmt.Sprintf("%s|%s|%s|%s", loc.Address, loc.Campaign, loc.CampaignID, loc.POIID),
+									},
+								}
+							}
+						}
+						mu.Unlock()
+					}
+				}
+			}
+
+			pf.Close()
+			runtime.GC()
+		}
+
+		// Save to JSON
+		err = dt.saveCampaignIntersectionJSON(deviceMap, dateStr)
+		if err != nil {
+			return fmt.Errorf("failed to save campaign intersection: %w", err)
+		}
+
+		fmt.Printf("  ✅ Step 1 completed: %d unique devices in campaigns\n", len(deviceMap))
+	}
+
+	// STEP 2: Time Filtering WITH CAMPAIGN FILTER
+	if runStep2 {
+		fmt.Printf("\n⏰ STEP 2: Time Filtering for %s\n", dateStr)
+
+		// Load campaign device set from Step 1
+		campaignDeviceSet, err := dt.loadCampaignDeviceSetFromJSON(dateStr)
+		if err != nil {
+			return fmt.Errorf("step 2 requires Step 1: %w", err)
+		}
+
+		fmt.Printf("  📋 Filtering for %d campaign devices\n", len(campaignDeviceSet))
+
+		dt.NTFDC.Store(0)
+
+		err = dt.initParquetWriter(dateStr)
+		if err != nil {
+			return fmt.Errorf("failed to init parquet writer: %w", err)
+		}
+
+		parquetFiles, err := filepath.Glob(filepath.Join(folderPath, "*.parquet"))
+		if err != nil {
+			dt.closeParquetWriter()
+			return fmt.Errorf("failed to find parquet files: %w", err)
+		}
+
+		fmt.Printf("  📂 Processing %d parquet files...\n", len(parquetFiles))
+
+		for idx, parquetFile := range parquetFiles {
+			if idx%10 == 0 {
+				fmt.Printf("    🔄 File %d/%d...\n", idx+1, len(parquetFiles))
+			}
+
+			pf, err := file.OpenParquetFile(parquetFile, false)
+			if err != nil {
+				continue
+			}
+
+			numRowGroups := pf.NumRowGroups()
+			for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
+				dt.processRowGroupWithTimeFilter(pf, rgIdx, campaignDeviceSet)
+			}
+
+			pf.Close()
+			runtime.GC()
+		}
+
+		dt.parquetMutex.Lock()
+		dt.flushParquetBatchUnsafe()
+		dt.parquetMutex.Unlock()
+
+		dt.closeParquetWriter()
+
+		fmt.Printf("  ✅ Step 2 completed: %d records passed filters\n", dt.NTFDC.Load())
+	}
+
+	return nil
+}
+
+// loadCampaignDeviceSetFromJSON - CRITICAL FIX for Step 2
+func (dt *DeviceTracker) loadCampaignDeviceSetFromJSON(dateStr string) (map[string]bool, error) {
+	jsonPath := filepath.Join(dt.OutputFolder, "campaign_intersection", dateStr,
+		fmt.Sprintf("campaign_devices_%s.json", dateStr))
+
+	if _, err := os.Stat(jsonPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("campaign JSON not found: %s (run Step 1 first)", jsonPath)
+	}
+
+	file, err := os.Open(jsonPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var campaignOutput CampaignIntersectionOutput
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&campaignOutput); err != nil {
+		return nil, err
+	}
+
+	deviceSet := make(map[string]bool, 100000)
+	for _, campaign := range campaignOutput.Campaigns {
+		for _, poi := range campaign.POIs {
+			for _, device := range poi.Devices {
+				deviceSet[device.DeviceID] = true
+			}
+		}
+	}
+
+	return deviceSet, nil
+}
+
+// processRowGroupWithTimeFilter - MODIFIED with campaign filter
+func (dt *DeviceTracker) processRowGroupWithTimeFilter(pf *file.Reader, rgIdx int, campaignDeviceSet map[string]bool) error {
+	records, err := dt.readRowGroup(pf, rgIdx)
+	if err != nil {
+		return err
+	}
+
+	for i := range records {
+		record := &records[i]
+
+		// CRITICAL: Filter by campaign devices first
+		if !campaignDeviceSet[record.DeviceID] {
+			continue
+		}
+
+		// Then check time filter
+		if dt.isWithinTimeFilter(record.EventTimestamp) {
+			dt.parquetMutex.Lock()
+			dt.parquetBatch = append(dt.parquetBatch, TimeFilteredRecord{
+				DeviceID:       record.DeviceID,
+				EventTimestamp: record.EventTimestamp,
+				Latitude:       record.Latitude,
+				Longitude:      record.Longitude,
+				LoadDate:       time.Now(),
+			})
+
+			if len(dt.parquetBatch) >= parquetBatchSize {
+				dt.flushParquetBatchUnsafe()
+			}
+			dt.parquetMutex.Unlock()
+
+			dt.NTFDC.Add(1)
+		}
+	}
+
+	return nil
+}
+
+func (dt *DeviceTracker) saveCampaignIntersectionJSON(deviceMap map[string]map[string]MinimalDeviceRecord, dateStr string) error {
+	// Group by campaign and POI
+	campaignMap := make(map[string]map[string][]MinimalDeviceRecord)
+
+	for _, data := range deviceMap {
+		deviceRecord := data["device"]
+		locData := data["loc"].DeviceID
+
+		parts := strings.Split(locData, "|")
+		if len(parts) != 4 {
+			continue
+		}
+
+		address, campaign, campaignID, poiID := parts[0], parts[1], parts[2], parts[3]
+
+		if _, exists := campaignMap[campaignID]; !exists {
+			campaignMap[campaignID] = make(map[string][]MinimalDeviceRecord)
+		}
+
+		key := fmt.Sprintf("%s|%s|%s", poiID, address, campaign)
+		campaignMap[campaignID][key] = append(campaignMap[campaignID][key], deviceRecord)
+	}
+
+	// Build output structure
+	campaigns := make([]CampaignDevices, 0)
+	totalDevices := 0
+
+	for campaignID, poiMap := range campaignMap {
+		pois := make([]POIDevices, 0)
+		campaignDeviceCount := 0
+		var campaignName string
+
+		for key, devices := range poiMap {
+			parts := strings.Split(key, "|")
+			poiID, poiName, campName := parts[0], parts[1], parts[2]
+			campaignName = campName
+
+			pois = append(pois, POIDevices{
+				POIID:   poiID,
+				POIName: poiName,
+				Devices: devices,
+				Count:   len(devices),
+			})
+
+			campaignDeviceCount += len(devices)
+		}
+
+		campaigns = append(campaigns, CampaignDevices{
+			CampaignID:   campaignID,
+			CampaignName: campaignName,
+			POIs:         pois,
+			TotalDevices: campaignDeviceCount,
+		})
+
+		totalDevices += campaignDeviceCount
+	}
+
+	output := CampaignIntersectionOutput{
+		ProcessedDate:    dateStr,
+		TotalDevices:     totalDevices,
+		TotalCampaigns:   len(campaigns),
+		ProcessingTimeMs: 0,
+		Campaigns:        campaigns,
+	}
+
+	// Save JSON
+	outputDir := filepath.Join(dt.OutputFolder, "campaign_intersection", dateStr)
+	os.MkdirAll(outputDir, 0755)
+
+	jsonPath := filepath.Join(outputDir, fmt.Sprintf("campaign_devices_%s.json", dateStr))
+	file, err := os.Create(jsonPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(output)
+}
+
+// ============================================================================
+// PARQUET OPERATIONS
+// ============================================================================
 
 func (dt *DeviceTracker) isWithinTimeFilter(eventTime time.Time) bool {
 	hour := eventTime.Hour()
@@ -262,7 +741,6 @@ func (dt *DeviceTracker) initParquetWriter(dateStr string) error {
 	timeFilteredFolder := filepath.Join(dt.OutputFolder, "time_filtered", dateStr)
 	os.MkdirAll(timeFilteredFolder, 0755)
 
-	// Format: time_filtered_loaddate20251020.parquet
 	parquetPath := filepath.Join(timeFilteredFolder, fmt.Sprintf("time_filtered_loaddate%s.parquet", dateStr))
 
 	file, err := os.Create(parquetPath)
@@ -297,8 +775,6 @@ func (dt *DeviceTracker) initParquetWriter(dateStr string) error {
 	dt.parquetSchema = schema
 	dt.currentDate = dateStr
 	dt.parquetBatch = make([]TimeFilteredRecord, 0, parquetBatchSize)
-
-	fmt.Printf("✅ Initialized Parquet writer for date: %s at %s\n", dateStr, parquetPath)
 
 	return nil
 }
@@ -348,665 +824,28 @@ func (dt *DeviceTracker) flushParquetBatchUnsafe() error {
 	defer record.Release()
 
 	if err := dt.parquetWriter.Write(record); err != nil {
-		return fmt.Errorf("failed to write to parquet: %w", err)
+		return fmt.Errorf("failed to write parquet batch: %w", err)
 	}
-
-	fmt.Printf("Flushed %d records to Parquet\n", len(dt.parquetBatch))
 
 	dt.parquetBatch = dt.parquetBatch[:0]
-
 	return nil
 }
 
-func (dt *DeviceTracker) closeParquetWriterUnsafe() error {
-	if dt.parquetWriter == nil {
-		return nil
-	}
+func (dt *DeviceTracker) closeParquetWriter() {
+	dt.parquetMutex.Lock()
+	defer dt.parquetMutex.Unlock()
+	dt.closeParquetWriterUnsafe()
+}
 
-	if len(dt.parquetBatch) > 0 {
-		if err := dt.flushParquetBatchUnsafe(); err != nil {
-			fmt.Printf("Error flushing final batch: %v\n", err)
-		}
+func (dt *DeviceTracker) closeParquetWriterUnsafe() {
+	if dt.parquetWriter != nil {
+		dt.parquetWriter.Close()
+		dt.parquetWriter = nil
 	}
-
-	if err := dt.parquetWriter.Close(); err != nil {
-		fmt.Printf("Error closing parquet writer: %v\n", err)
-	}
-
 	if dt.parquetFile != nil {
 		dt.parquetFile.Close()
+		dt.parquetFile = nil
 	}
-
-	dt.parquetWriter = nil
-	dt.parquetFile = nil
-
-	return nil
-}
-
-func (dt *DeviceTracker) saveToMongoDB(campaignMap map[string]map[string][]MinimalDeviceRecord,
-	campaignNames map[string]string,
-	poiNames map[string]map[string]string,
-	processedDate string) error {
-
-	if dt.mongoCollection == nil {
-		fmt.Println("MongoDB not configured, skipping MongoDB save")
-		return nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	var documents []interface{}
-	createdAt := time.Now()
-
-	for campaignID, poisMap := range campaignMap {
-		for poiID, devices := range poisMap {
-			poiObjectID, err := primitive.ObjectIDFromHex(poiID)
-			if err != nil {
-				fmt.Printf("Warning: Invalid POI ID %s, skipping: %v\n", poiID, err)
-				continue
-			}
-
-			doc := POIMongoDocument{
-				POIID:         poiObjectID,
-				POIName:       poiNames[campaignID][poiID],
-				ProcessedDate: processedDate,
-				DeviceCount:   len(devices),
-				Devices:       devices,
-				CreatedAt:     createdAt,
-			}
-			documents = append(documents, doc)
-		}
-	}
-
-	if len(documents) == 0 {
-		fmt.Println("No documents to insert into MongoDB")
-		return nil
-	}
-
-	result, err := dt.mongoCollection.InsertMany(ctx, documents)
-	if err != nil {
-		return fmt.Errorf("failed to insert documents into MongoDB: %w", err)
-	}
-
-	fmt.Printf("✅ Successfully inserted %d POI documents into MongoDB\n", len(result.InsertedIDs))
-	return nil
-}
-
-func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step1 bool, step2 bool) ([]DeviceRecord, error) {
-	records, err := dt.readParquetOptimized(parqFilePath)
-	if err != nil {
-		return nil, err
-	}
-
-	dateStr := dt.extractDateFromPath(parqFilePath)
-	insertDate, _ := time.Parse("20060102", dateStr)
-	loadDate := time.Date(insertDate.Year(), insertDate.Month(), insertDate.Day(), 0, 0, 0, 0, time.UTC)
-
-	intersectRecords := make([]DeviceRecord, 0, len(records)/10)
-
-	dt.LocDataMutex.RLock()
-	defer dt.LocDataMutex.RUnlock()
-
-	for i := range records {
-		records[i].InsertDate = insertDate
-
-		if step2 {
-			if dt.isWithinTimeFilter(records[i].EventTimestamp) {
-				tfRecord := TimeFilteredRecord{
-					DeviceID:       records[i].DeviceID,
-					EventTimestamp: records[i].EventTimestamp,
-					Latitude:       records[i].Latitude,
-					Longitude:      records[i].Longitude,
-					LoadDate:       loadDate,
-				}
-
-				if err := dt.addToParquetBatch(tfRecord, dateStr); err != nil {
-					fmt.Printf("Error adding to Parquet batch: %v\n", err)
-				}
-			} else {
-				dt.NTFDC.Add(1)
-			}
-		}
-
-		if step1 {
-			point := orb.Point{records[i].Longitude, records[i].Latitude}
-
-			candidates := dt.findIntersectingPolygons(records[i].Longitude, records[i].Latitude)
-
-			for _, idx := range candidates {
-				if !dt.LocData[idx].Bounds.Contains(point) {
-					continue
-				}
-
-				if planar.PolygonContains(dt.LocData[idx].Geometry, point) {
-					records[i].Address = dt.LocData[idx].Address
-					records[i].Campaign = dt.LocData[idx].Campaign
-					records[i].CampaignID = dt.LocData[idx].CampaignID
-					records[i].POIID = dt.LocData[idx].POIID
-					intersectRecords = append(intersectRecords, records[i])
-					break
-				}
-			}
-		}
-	}
-
-	log.Println("Non Time Filtered Devices Count:", dt.NTFDC.Load())
-	return intersectRecords, nil
-}
-
-func NewDeviceTracker(campaignAPIURL, outputFolder string, mongoConfig MongoConfig) (*DeviceTracker, error) {
-	numWorkers := runtime.NumCPU()
-	if numWorkers > 16 {
-		numWorkers = 16
-	}
-
-	var mongoClient *mongo.Client
-	var mongoCollection *mongo.Collection
-
-	if mongoConfig.URI != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		clientOptions := options.Client().ApplyURI(mongoConfig.URI)
-		var err error
-		mongoClient, err = mongo.Connect(ctx, clientOptions)
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
-		}
-
-		if err := mongoClient.Ping(ctx, nil); err != nil {
-			return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
-		}
-
-		fmt.Println("✅ Successfully connected to MongoDB")
-
-		mongoCollection = mongoClient.Database(mongoConfig.Database).Collection(mongoConfig.Collection)
-	}
-
-	dt := &DeviceTracker{
-		ctx:              context.Background(),
-		FilterInTime:     "02:00:00",
-		FilterOutTime:    "04:30:00",
-		TimeColumnName:   "event_timestamp",
-		DeviceIDColumn:   "device_id",
-		LatColumn:        "latitude",
-		LonColumn:        "longitude",
-		CampaignAPIURL:   campaignAPIURL,
-		OutputFolder:     outputFolder,
-		IdleDeviceBuffer: 10.0,
-		NumWorkers:       numWorkers,
-		spatialIndex:     make(map[int][]int),
-		parquetBatch:     make([]TimeFilteredRecord, 0, parquetBatchSize),
-		mongoClient:      mongoClient,
-		mongoCollection:  mongoCollection,
-		mongoConfig:      mongoConfig,
-	}
-
-	if err := dt.parseFilterTimes(); err != nil {
-		return nil, fmt.Errorf("failed to parse filter times: %w", err)
-	}
-
-	return dt, nil
-}
-
-func (dt *DeviceTracker) parseFilterTimes() error {
-	startParts := strings.Split(dt.FilterInTime, ":")
-	if len(startParts) != 3 {
-		return fmt.Errorf("invalid FilterInTime format: %s", dt.FilterInTime)
-	}
-
-	var err error
-	dt.filterStartHour, err = strconv.Atoi(startParts[0])
-	if err != nil {
-		return fmt.Errorf("invalid start hour: %w", err)
-	}
-
-	dt.filterStartMin, err = strconv.Atoi(startParts[1])
-	if err != nil {
-		return fmt.Errorf("invalid start minute: %w", err)
-	}
-
-	dt.filterStartSec, err = strconv.Atoi(startParts[2])
-	if err != nil {
-		return fmt.Errorf("invalid start second: %w", err)
-	}
-
-	endParts := strings.Split(dt.FilterOutTime, ":")
-	if len(endParts) != 3 {
-		return fmt.Errorf("invalid FilterOutTime format: %s", dt.FilterOutTime)
-	}
-
-	dt.filterEndHour, err = strconv.Atoi(endParts[0])
-	if err != nil {
-		return fmt.Errorf("invalid end hour: %w", err)
-	}
-
-	dt.filterEndMin, err = strconv.Atoi(endParts[1])
-	if err != nil {
-		return fmt.Errorf("invalid end minute: %w", err)
-	}
-
-	dt.filterEndSec, err = strconv.Atoi(endParts[2])
-	if err != nil {
-		return fmt.Errorf("invalid end second: %w", err)
-	}
-
-	dt.startSeconds = dt.filterStartHour*3600 + dt.filterStartMin*60 + dt.filterStartSec
-	dt.endSeconds = dt.filterEndHour*3600 + dt.filterEndMin*60 + dt.filterEndSec
-
-	fmt.Printf("Time filter configured: %02d:%02d:%02d to %02d:%02d:%02d\n",
-		dt.filterStartHour, dt.filterStartMin, dt.filterStartSec,
-		dt.filterEndHour, dt.filterEndMin, dt.filterEndSec)
-
-	return nil
-}
-
-func (dt *DeviceTracker) Close() error {
-	dt.parquetMutex.Lock()
-	defer dt.parquetMutex.Unlock()
-
-	if err := dt.closeParquetWriterUnsafe(); err != nil {
-		fmt.Printf("Error closing parquet writer: %v\n", err)
-	}
-
-	if dt.mongoClient != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		dt.mongoClient.Disconnect(ctx)
-	}
-
-	return nil
-}
-
-func (dt *DeviceTracker) addToParquetBatch(record TimeFilteredRecord, dateStr string) error {
-	dt.parquetMutex.Lock()
-	defer dt.parquetMutex.Unlock()
-
-	if dt.parquetWriter == nil || dt.currentDate != dateStr {
-		dt.parquetMutex.Unlock()
-		if err := dt.initParquetWriter(dateStr); err != nil {
-			dt.parquetMutex.Lock()
-			return err
-		}
-		dt.parquetMutex.Lock()
-	}
-
-	dt.parquetBatch = append(dt.parquetBatch, record)
-
-	if len(dt.parquetBatch) >= parquetBatchSize {
-		return dt.flushParquetBatchUnsafe()
-	}
-
-	return nil
-}
-
-func (dt *DeviceTracker) getSpatialKey(lon, lat float64) int {
-	gridSize := 0.01
-	x := int(lon / gridSize)
-	y := int(lat / gridSize)
-	return x*100000 + y
-}
-
-func (dt *DeviceTracker) buildSpatialIndex() {
-	dt.spatialIndex = make(map[int][]int)
-
-	for i := range dt.LocData {
-		bounds := dt.LocData[i].Geometry.Bound()
-		dt.LocData[i].Bounds = bounds
-
-		minX := int(bounds.Min[0] / 0.01)
-		maxX := int(bounds.Max[0] / 0.01)
-		minY := int(bounds.Min[1] / 0.01)
-		maxY := int(bounds.Max[1] / 0.01)
-
-		for x := minX; x <= maxX; x++ {
-			for y := minY; y <= maxY; y++ {
-				key := x*100000 + y
-				dt.spatialIndex[key] = append(dt.spatialIndex[key], i)
-			}
-		}
-	}
-
-	fmt.Printf("Built spatial index with %d cells\n", len(dt.spatialIndex))
-}
-
-func (dt *DeviceTracker) findIntersectingPolygons(lon, lat float64) []int {
-	key := dt.getSpatialKey(lon, lat)
-	return dt.spatialIndex[key]
-}
-
-func (dt *DeviceTracker) fetchCampaignsFromAPI() error {
-	fmt.Printf("Fetching campaigns from API: %s\n", dt.CampaignAPIURL)
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	resp, err := client.Get(dt.CampaignAPIURL)
-	if err != nil {
-		return fmt.Errorf("failed to fetch campaigns from API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API returned non-200 status code: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read API response: %w", err)
-	}
-
-	var apiResponse APIResponse
-	if err := json.Unmarshal(body, &apiResponse); err != nil {
-		return fmt.Errorf("failed to parse API response: %w", err)
-	}
-
-	if !apiResponse.Success {
-		return fmt.Errorf("API returned success=false: %s", apiResponse.Message)
-	}
-
-	dt.LocDataMutex.Lock()
-	defer dt.LocDataMutex.Unlock()
-
-	dt.LocData = make([]LocationRecord, 0)
-
-	for _, campaign := range apiResponse.Data {
-		for _, poi := range campaign.POIs {
-			if len(poi.Polygon) < 3 {
-				fmt.Printf("Warning: POI %s has insufficient points for polygon\n", poi.Name)
-				continue
-			}
-
-			ring := make(orb.Ring, 0, len(poi.Polygon))
-			for _, coord := range poi.Polygon {
-				if len(coord) >= 2 {
-					ring = append(ring, orb.Point{coord[0], coord[1]})
-				}
-			}
-
-			if len(ring) > 0 && ring[0] != ring[len(ring)-1] {
-				ring = append(ring, ring[0])
-			}
-
-			polygon := orb.Polygon{ring}
-
-			loc := LocationRecord{
-				Address:    poi.Name,
-				Campaign:   campaign.Name,
-				CampaignID: campaign.ID,
-				POIID:      poi.ID,
-				Geometry:   polygon,
-			}
-			dt.LocData = append(dt.LocData, loc)
-		}
-	}
-
-	fmt.Printf("Loaded %d location records from API (%d campaigns)\n",
-		len(dt.LocData), len(apiResponse.Data))
-
-	return nil
-}
-
-func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string, step1 bool, step2 bool) error {
-	startTime := time.Now()
-
-	var fileList []string
-
-	patterns := []string{
-		filepath.Join(parquetFolder, "*.parquet"),
-		filepath.Join(parquetFolder, "*.snappy.parquet"),
-		filepath.Join(parquetFolder, "*.zstd.parquet"),
-		filepath.Join(parquetFolder, "*.gzip.parquet"),
-		filepath.Join(parquetFolder, "part-*.parquet"),
-	}
-
-	for _, pattern := range patterns {
-		files, err := filepath.Glob(pattern)
-		if err == nil && len(files) > 0 {
-			fileList = files
-			break
-		}
-	}
-
-	if len(fileList) == 0 {
-		fmt.Printf("No parquet files found, searching recursively in: %s\n", parquetFolder)
-		filepath.Walk(parquetFolder, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".parquet") {
-				fileList = append(fileList, path)
-			}
-			return nil
-		})
-	}
-
-	if len(fileList) == 0 {
-		return fmt.Errorf("no parquet files found in %s", parquetFolder)
-	}
-
-	fmt.Printf("Total Files: %d\n", len(fileList))
-
-	dateStr := dt.extractDateFromPath(parquetFolder)
-
-	if step2 {
-		if err := dt.initParquetWriter(dateStr); err != nil {
-			return fmt.Errorf("failed to initialize parquet writer: %w", err)
-		}
-	}
-
-	campaignIntersectionFolder := filepath.Join(dt.OutputFolder, "campaign_intersection", dateStr)
-	os.MkdirAll(campaignIntersectionFolder, 0755)
-
-	jobs := make(chan string, len(fileList))
-	results := make(chan []DeviceRecord, workerPoolSize)
-	var wg sync.WaitGroup
-
-	for w := 0; w < workerPoolSize; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for parqFile := range jobs {
-				records, err := dt.processCampaignFile(parqFile, step1, step2)
-				if err != nil {
-					fmt.Printf("Error processing %s: %v\n", filepath.Base(parqFile), err)
-					continue
-				}
-				if len(records) > 0 {
-					results <- records
-				}
-			}
-		}()
-	}
-
-	var allRecords []DeviceRecord
-	var resultWg sync.WaitGroup
-	resultWg.Add(1)
-	go func() {
-		defer resultWg.Done()
-		for records := range results {
-			allRecords = append(allRecords, records...)
-		}
-	}()
-
-	for i, file := range fileList {
-		if i%100 == 0 {
-			fmt.Printf("Queued: %d/%d files\n", i, len(fileList))
-		}
-		jobs <- file
-	}
-	close(jobs)
-
-	wg.Wait()
-	close(results)
-	resultWg.Wait()
-
-	seen := make(map[string]struct{})
-	unique := make([]DeviceRecord, 0, len(allRecords))
-	for i := range allRecords {
-		if _, exists := seen[allRecords[i].DeviceID]; !exists {
-			seen[allRecords[i].DeviceID] = struct{}{}
-			unique = append(unique, allRecords[i])
-		}
-	}
-
-	campaignMap := make(map[string]map[string][]MinimalDeviceRecord)
-	campaignNames := make(map[string]string)
-	poiNames := make(map[string]map[string]string)
-
-	for i := range unique {
-		campaignID := unique[i].CampaignID
-		if campaignID == "" {
-			campaignID = "unknown"
-		}
-		poiID := unique[i].POIID
-		if poiID == "" {
-			poiID = "unknown"
-		}
-
-		if _, exists := campaignMap[campaignID]; !exists {
-			campaignMap[campaignID] = make(map[string][]MinimalDeviceRecord)
-			poiNames[campaignID] = make(map[string]string)
-		}
-
-		minimalDevice := MinimalDeviceRecord{
-			DeviceID:       unique[i].DeviceID,
-			EventTimestamp: unique[i].EventTimestamp,
-		}
-
-		campaignMap[campaignID][poiID] = append(campaignMap[campaignID][poiID], minimalDevice)
-		campaignNames[campaignID] = unique[i].Campaign
-		poiNames[campaignID][poiID] = unique[i].Address
-	}
-
-	if dt.mongoCollection != nil {
-		fmt.Println("\n💾 Saving to MongoDB...")
-		if err := dt.saveToMongoDB(campaignMap, campaignNames, poiNames, dateStr); err != nil {
-			fmt.Printf("Warning: MongoDB save failed: %v\n", err)
-		}
-	}
-
-	campaigns := make([]CampaignDevices, 0, len(campaignMap))
-	for campaignID, poisMap := range campaignMap {
-		pois := make([]POIDevices, 0, len(poisMap))
-		totalDevices := 0
-
-		for poiID, devices := range poisMap {
-			pois = append(pois, POIDevices{
-				POIID:   poiID,
-				POIName: poiNames[campaignID][poiID],
-				Devices: devices,
-				Count:   len(devices),
-			})
-			totalDevices += len(devices)
-		}
-
-		campaigns = append(campaigns, CampaignDevices{
-			CampaignID:   campaignID,
-			CampaignName: campaignNames[campaignID],
-			POIs:         pois,
-			TotalDevices: totalDevices,
-		})
-	}
-
-	output := CampaignIntersectionOutput{
-		ProcessedDate:    dateStr,
-		TotalDevices:     len(unique),
-		TotalCampaigns:   len(campaigns),
-		ProcessingTimeMs: time.Since(startTime).Milliseconds(),
-		Campaigns:        campaigns,
-	}
-
-	jsonPath := filepath.Join(campaignIntersectionFolder, fmt.Sprintf("campaign_devices_%s.json", dateStr))
-	if err := dt.saveJSON(jsonPath, output); err != nil {
-		return fmt.Errorf("failed to save JSON: %w", err)
-	}
-
-	fmt.Printf("(DT) Completed Campaign Intersection in %v - Saved %d devices to %s\n",
-		time.Since(startTime), len(unique), jsonPath)
-
-	if step2 {
-		timeFilteredFolder := filepath.Join(dt.OutputFolder, "time_filtered", dateStr)
-		os.MkdirAll(timeFilteredFolder, 0755)
-
-		timeFilterStats := TimeFilterOutput{
-			ProcessedDate:     dateStr,
-			FilterStartTime:   dt.FilterInTime,
-			FilterEndTime:     dt.FilterOutTime,
-			TotalRecords:      int64(len(allRecords)),
-			FilteredInRecords: int64(len(allRecords)) - dt.NTFDC.Load(),
-			FilteredOutCount:  dt.NTFDC.Load(),
-			ProcessingTimeMs:  time.Since(startTime).Milliseconds(),
-		}
-
-		statsPath := filepath.Join(timeFilteredFolder, fmt.Sprintf("time_filter_stats_%s.json", dateStr))
-		if err := dt.saveJSON(statsPath, timeFilterStats); err != nil {
-			fmt.Printf("Warning: failed to save time filter stats: %v\n", err)
-		}
-
-		fmt.Printf("✅ Time-filtered data saved to Parquet in: %s\n", timeFilteredFolder)
-	}
-
-	return nil
-}
-
-func (dt *DeviceTracker) saveJSON(filePath string, data interface{}) error {
-	file, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(data)
-}
-
-func (dt *DeviceTracker) loadJSON(filePath string, data interface{}) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	return decoder.Decode(data)
-}
-
-func (dt *DeviceTracker) readParquetOptimized(filePath string) ([]DeviceRecord, error) {
-	pf, err := file.OpenParquetFile(filePath, false)
-	if err != nil {
-		return nil, err
-	}
-	defer pf.Close()
-
-	return dt.readParquetFromFile(pf)
-}
-
-func (dt *DeviceTracker) readParquetFromFile(pf *file.Reader) ([]DeviceRecord, error) {
-	numRowGroups := pf.NumRowGroups()
-	if numRowGroups == 0 {
-		return nil, nil
-	}
-
-	totalRows := 0
-	for i := 0; i < numRowGroups; i++ {
-		totalRows += int(pf.RowGroup(i).NumRows())
-	}
-
-	records := make([]DeviceRecord, 0, totalRows)
-
-	for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
-		rgRecords, err := dt.readRowGroup(pf, rgIdx)
-		if err != nil {
-			continue
-		}
-		records = append(records, rgRecords...)
-	}
-
-	return records, nil
 }
 
 func (dt *DeviceTracker) readRowGroup(pf *file.Reader, rgIdx int) ([]DeviceRecord, error) {
@@ -1098,6 +937,44 @@ func (dt *DeviceTracker) readRowGroup(pf *file.Reader, rgIdx int) ([]DeviceRecor
 	}
 
 	return records, nil
+}
+
+func (dt *DeviceTracker) readTimestampColumn(rg *file.RowGroupReader, colIdx int, numRows int) []time.Time {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Panic reading timestamp column: %v\n", r)
+		}
+	}()
+
+	col, err := rg.Column(colIdx)
+	if err != nil {
+		return make([]time.Time, 0)
+	}
+
+	result := make([]time.Time, 0, numRows)
+
+	switch reader := col.(type) {
+	case *file.Int64ColumnChunkReader:
+		values := make([]int64, 8192)
+		defLevels := make([]int16, 8192)
+
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
+			if n == 0 {
+				break
+			}
+			for i := 0; i < int(n); i++ {
+				if defLevels[i] > 0 {
+					t := time.Unix(0, values[i]*1000).UTC()
+					result = append(result, t)
+				} else {
+					result = append(result, time.Time{})
+				}
+			}
+		}
+	}
+
+	return result
 }
 
 func (dt *DeviceTracker) readStringColumn(rg *file.RowGroupReader, colIdx int, numRows int) []string {
@@ -1201,11 +1078,418 @@ func (dt *DeviceTracker) extractDateFromPath(path string) string {
 	return ""
 }
 
+// ============================================================================
+// STEP 3: IDLE DEVICE DETECTION
+// ============================================================================
+
+func (dt *DeviceTracker) RunIdleDeviceSearch(folderList []string, targetDates []string) error {
+	fmt.Println("\n╔════════════════════════════════════════════════════════╗")
+	fmt.Println("║   STEP 3: IDLE DEVICE DETECTION                       ║")
+	fmt.Println("╚════════════════════════════════════════════════════════╝")
+
+	idleDevicesFolder := filepath.Join(dt.OutputFolder, "idle_devices")
+	os.MkdirAll(idleDevicesFolder, 0755)
+
+	for _, targetDate := range targetDates {
+		fmt.Printf("\n🔍 Processing Date: %s\n", targetDate)
+		err := dt.FindIdleDevicesStreamingByDate(folderList, targetDate)
+		if err != nil {
+			fmt.Printf("  ⚠️  Error: %v\n", err)
+			continue
+		}
+		runtime.GC()
+	}
+
+	err := dt.MergeIdleDevicesByEventDate()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (dt *DeviceTracker) FindIdleDevicesStreamingByDate(folderList []string, targetDate string) error {
+	campaignMetadata, err := dt.GetUniqIdDataFrame()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  📋 Loaded %d campaign devices\n", len(campaignMetadata))
+
+	campaignDeviceSet := make(map[string]bool, len(campaignMetadata))
+	for deviceID := range campaignMetadata {
+		campaignDeviceSet[deviceID] = true
+	}
+
+	totalIdle := 0
+
+	for _, folderName := range folderList {
+		parquetPath := filepath.Join(
+			dt.OutputFolder,
+			"time_filtered",
+			strings.TrimPrefix(folderName, "load_date="),
+			fmt.Sprintf("time_filtered_loaddate%s.parquet", strings.TrimPrefix(folderName, "load_date=")),
+		)
+
+		if _, err := os.Stat(parquetPath); os.IsNotExist(err) {
+			continue
+		}
+
+		fmt.Printf("    📂 Processing: %s\n", filepath.Base(parquetPath))
+
+		idleCount, _, _, err := dt.processParquetFileStreaming(parquetPath, campaignMetadata, campaignDeviceSet)
+		if err != nil {
+			fmt.Printf("    ⚠️  Error: %v\n", err)
+			continue
+		}
+
+		totalIdle += idleCount
+		runtime.GC()
+	}
+
+	fmt.Printf("  ✅ Found %d idle devices\n", totalIdle)
+	return nil
+}
+
+func (dt *DeviceTracker) processParquetFileStreaming(
+	parquetPath string,
+	campaignMetadata map[string]CampaignMetadata,
+	campaignDeviceSet map[string]bool,
+) (int, int, int, error) {
+
+	pf, err := file.OpenParquetFile(parquetPath, false)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer pf.Close()
+
+	numRowGroups := pf.NumRowGroups()
+	deviceStates := make(map[string]*DeviceTrackingState)
+	totalRecords := 0
+	filteredRecords := 0
+
+	for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
+		if rgIdx%50 == 0 {
+			fmt.Printf("      🔄 Row group %d/%d (tracking %d devices)...\n",
+				rgIdx+1, numRowGroups, len(deviceStates))
+		}
+
+		records, err := dt.readRowGroup(pf, rgIdx)
+		if err != nil {
+			continue
+		}
+
+		totalRecords += len(records)
+
+		filteredRecords += dt.updateDeviceStatesFiltered(
+			deviceStates,
+			records,
+			campaignMetadata,
+			campaignDeviceSet,
+		)
+
+		records = nil
+
+		if rgIdx%50 == 0 {
+			runtime.GC()
+		}
+	}
+
+	fmt.Printf("      ✅ Analyzed %d devices\n", len(deviceStates))
+
+	idleCount := dt.saveIdleDevicesFromStates(deviceStates, campaignMetadata)
+
+	deviceStates = nil
+	runtime.GC()
+
+	return idleCount, totalRecords, filteredRecords, nil
+}
+
+func (dt *DeviceTracker) updateDeviceStatesFiltered(
+	deviceStates map[string]*DeviceTrackingState,
+	records []DeviceRecord,
+	campaignMetadata map[string]CampaignMetadata,
+	campaignDeviceSet map[string]bool,
+) int {
+	bufferMeters := dt.IdleDeviceBuffer
+	filteredCount := 0
+
+	for i := range records {
+		record := &records[i]
+		deviceID := record.DeviceID
+
+		if !campaignDeviceSet[deviceID] {
+			continue
+		}
+
+		filteredCount++
+
+		state, exists := deviceStates[deviceID]
+		if !exists {
+			deviceStates[deviceID] = &DeviceTrackingState{
+				FirstPoint:  orb.Point{record.Longitude, record.Latitude},
+				FirstTime:   record.EventTimestamp,
+				IsStillIdle: true,
+				RecordCount: 1,
+			}
+			continue
+		}
+
+		if state.IsStillIdle {
+			point := orb.Point{record.Longitude, record.Latitude}
+			distance := geo.Distance(state.FirstPoint, point)
+
+			if distance > bufferMeters {
+				state.IsStillIdle = false
+			}
+		}
+		state.RecordCount++
+	}
+
+	return filteredCount
+}
+
+func (dt *DeviceTracker) saveIdleDevicesFromStates(
+	deviceStates map[string]*DeviceTrackingState,
+	campaignMetadata map[string]CampaignMetadata,
+) int {
+
+	idleDevicesByEventDate := make(map[string][]IdleDeviceResult)
+
+	for deviceID, state := range deviceStates {
+		if state.IsStillIdle && state.RecordCount >= 2 {
+			metadata, exists := campaignMetadata[deviceID]
+			if !exists {
+				continue
+			}
+
+			idleDevice := IdleDeviceResult{
+				DeviceID:    deviceID,
+				VisitedTime: metadata.EventTimestamp.Format(time.RFC3339),
+				Address:     metadata.Address,
+				Campaign:    metadata.Campaign,
+				CampaignID:  metadata.CampaignID,
+				POIID:       metadata.POIID,
+				Geometry:    fmt.Sprintf("POINT (%f %f)", state.FirstPoint[0], state.FirstPoint[1]),
+			}
+
+			eventDate := idleDevice.VisitedTime[:10]
+			idleDevicesByEventDate[eventDate] = append(idleDevicesByEventDate[eventDate], idleDevice)
+		}
+	}
+
+	savedCount := 0
+	if len(idleDevicesByEventDate) > 0 {
+		dt.saveIdleDevicesToFiles(idleDevicesByEventDate)
+		for _, devices := range idleDevicesByEventDate {
+			savedCount += len(devices)
+		}
+		fmt.Printf("      💾 Saved %d idle devices\n", savedCount)
+	}
+
+	return savedCount
+}
+
+func (dt *DeviceTracker) saveIdleDevicesToFiles(idleDevicesByEventDate map[string][]IdleDeviceResult) {
+	idleDevicesFolder := filepath.Join(dt.OutputFolder, "idle_devices")
+	os.MkdirAll(idleDevicesFolder, 0755)
+
+	for eventDate, newDevices := range idleDevicesByEventDate {
+		jsonPath := filepath.Join(idleDevicesFolder, fmt.Sprintf("idle_devices_%s.json", eventDate))
+
+		existingDevices := make([]IdleDeviceResult, 0)
+		if _, err := os.Stat(jsonPath); err == nil {
+			existingData, err := dt.loadIdleDevicesFromJSON(jsonPath)
+			if err == nil {
+				existingDevices = existingData
+			}
+		}
+
+		allDevices := append(existingDevices, newDevices...)
+		uniqueDevices := dt.deduplicateIdleDevices(allDevices)
+
+		output := IdleDevicesByDate{
+			EventDate:        eventDate,
+			TotalIdleDevices: len(uniqueDevices),
+			IdleDevices:      uniqueDevices,
+		}
+
+		file, err := os.Create(jsonPath)
+		if err != nil {
+			continue
+		}
+
+		encoder := json.NewEncoder(file)
+		encoder.SetIndent("", "  ")
+		encoder.Encode(output)
+		file.Close()
+	}
+}
+
+func (dt *DeviceTracker) loadIdleDevicesFromJSON(jsonPath string) ([]IdleDeviceResult, error) {
+	file, err := os.Open(jsonPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var data IdleDevicesByDate
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&data); err != nil {
+		return nil, err
+	}
+
+	return data.IdleDevices, nil
+}
+
+func (dt *DeviceTracker) deduplicateIdleDevices(devices []IdleDeviceResult) []IdleDeviceResult {
+	seen := make(map[string]bool)
+	unique := make([]IdleDeviceResult, 0, len(devices))
+
+	for _, device := range devices {
+		key := device.DeviceID
+		if !seen[key] {
+			seen[key] = true
+			unique = append(unique, device)
+		}
+	}
+
+	return unique
+}
+
+func (dt *DeviceTracker) MergeIdleDevicesByEventDate() error {
+	fmt.Println("\n📦 Merging idle device files...")
+
+	idleDevicesFolder := filepath.Join(dt.OutputFolder, "idle_devices")
+	pattern := filepath.Join(idleDevicesFolder, "idle_devices_*.json")
+
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+
+	if len(files) == 0 {
+		fmt.Println("  ⚠️  No idle device files found")
+		return nil
+	}
+
+	allIdleDevicesByDate := make(map[string][]IdleDeviceResult)
+	processedDates := make([]string, 0)
+	totalDevices := 0
+
+	for _, filePath := range files {
+		fileName := filepath.Base(filePath)
+		eventDate := strings.TrimPrefix(fileName, "idle_devices_")
+		eventDate = strings.TrimSuffix(eventDate, ".json")
+
+		devices, err := dt.loadIdleDevicesFromJSON(filePath)
+		if err != nil {
+			continue
+		}
+
+		allIdleDevicesByDate[eventDate] = devices
+		processedDates = append(processedDates, eventDate)
+		totalDevices += len(devices)
+
+		fmt.Printf("  ✓ Loaded %d devices from %s\n", len(devices), fileName)
+	}
+
+	sort.Strings(processedDates)
+
+	finalOutput := FinalIdleDevicesOutput{
+		ProcessedDates:    processedDates,
+		TotalIdleDevices:  totalDevices,
+		ProcessingTimeMs:  0,
+		IdleDevicesByDate: allIdleDevicesByDate,
+	}
+
+	finalJSONPath := filepath.Join(dt.OutputFolder, "Idle_devices.json")
+	file, err := os.Create(finalJSONPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(finalOutput)
+
+	fmt.Printf("  💾 Final output: %s\n", finalJSONPath)
+	fmt.Printf("  📊 Total: %d idle devices across %d dates\n", totalDevices, len(processedDates))
+
+	return nil
+}
+
+func (dt *DeviceTracker) GetUniqIdDataFrame() (map[string]CampaignMetadata, error) {
+	yesterday := time.Now().AddDate(0, 0, -1)
+	dateStr := yesterday.Format("20060102")
+
+	jsonPath := filepath.Join(dt.OutputFolder, "campaign_intersection", dateStr,
+		fmt.Sprintf("campaign_devices_%s.json", dateStr))
+
+	if _, err := os.Stat(jsonPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("campaign JSON not found: %s", jsonPath)
+	}
+
+	file, err := os.Open(jsonPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var campaignOutput CampaignIntersectionOutput
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&campaignOutput); err != nil {
+		return nil, err
+	}
+
+	metadata := make(map[string]CampaignMetadata, 100000)
+
+	for _, campaign := range campaignOutput.Campaigns {
+		for _, poi := range campaign.POIs {
+			for _, device := range poi.Devices {
+				deviceID := device.DeviceID
+
+				if _, exists := metadata[deviceID]; exists {
+					continue
+				}
+
+				metadata[deviceID] = CampaignMetadata{
+					DeviceID:       deviceID,
+					EventTimestamp: device.EventTimestamp,
+					Address:        poi.POIName,
+					Campaign:       campaign.CampaignName,
+					CampaignID:     campaign.CampaignID,
+					POIID:          poi.POIID,
+				}
+			}
+		}
+	}
+
+	return metadata, nil
+}
+
+func (dt *DeviceTracker) GetUniqueIdList() ([]string, error) {
+	metadata, err := dt.GetUniqIdDataFrame()
+	if err != nil {
+		return nil, err
+	}
+
+	idList := make([]string, 0, len(metadata))
+	for deviceID := range metadata {
+		idList = append(idList, deviceID)
+	}
+
+	return idList, nil
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
 func GetLastNDatesFromYesterday(n int) []string {
 	dates := make([]string, n)
 
 	for i := 0; i < n; i++ {
-		// Start from yesterday (i=0 is yesterday, i=1 is 2 days ago, etc.)
 		date := time.Now().AddDate(0, 0, -(i + 1))
 		dates[i] = date.Format("2006-01-02")
 	}
@@ -1217,14 +1501,11 @@ func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	yesterday := time.Now().AddDate(0, 0, -1)
-
 	yesterdayStr := yesterday.Format("2006-01-02")
 
-	dates := []string{
-		yesterdayStr, // "2025-10-21",
-	}
+	dates := []string{yesterdayStr}
 
-	folderList := make([]string, 0, len(GetLastNDatesFromYesterday(7)))
+	folderList := make([]string, 0, len(dates))
 	for _, d := range dates {
 		folder := "load_date=" + strings.ReplaceAll(d, "-", "")
 		folderList = append(folderList, folder)
@@ -1254,7 +1535,7 @@ func RunDeviceTracker(runSteps []int) error {
 	step2 := containsStep(runSteps, 2)
 	step3 := containsStep(runSteps, 3)
 
-	if step1 || step3 {
+	if step1 || step2 || step3 {
 		if err := dt.fetchCampaignsFromAPI(); err != nil {
 			return fmt.Errorf("failed to fetch campaigns from API: %w", err)
 		}
@@ -1273,7 +1554,7 @@ func RunDeviceTracker(runSteps []int) error {
 			runningSteps = "Time Filtering"
 		}
 
-		fmt.Printf("\n========== Running %s ==========", runningSteps)
+		fmt.Printf("\n========== Running %s ==========\n", runningSteps)
 		for _, folder := range folderList {
 			err := dt.FindCampaignIntersectionForFolder("/mnt/blobcontainer/"+folder, step1, step2)
 			if err != nil {
@@ -1281,7 +1562,7 @@ func RunDeviceTracker(runSteps []int) error {
 			}
 		}
 
-		fmt.Printf("\n%s Completed", runningSteps)
+		fmt.Printf("\n%s Completed\n", runningSteps)
 	}
 
 	if step3 {
@@ -1305,12 +1586,15 @@ func containsStep(steps []int, step int) bool {
 
 func main() {
 	fmt.Println("===========================================")
-	fmt.Println("   Device Tracker - Parquet Output")
+	fmt.Println("   Device Tracker - Complete Fixed")
 	fmt.Println("===========================================")
 
 	startTime := time.Now()
 
-	runSteps := []int{3}
+	// IMPORTANT: Run steps in order!
+	// First time: runSteps := []int{1, 2}  // Creates campaign + time-filtered data
+	// Second time: runSteps := []int{3}    // Finds idle devices
+	runSteps := []int{1, 2, 3} // Change to []int{3} after Step 1 & 2 complete
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
