@@ -408,8 +408,7 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 		return nil, err
 	}
 
-	ctx := context.Background()
-	recordReader, err := arrowReader.GetRecordReader(ctx, nil, nil)
+	recordReader, err := arrowReader.GetRecordReader(context.TODO(), nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -441,7 +440,7 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 				}
 			}
 
-			if idx, ok := colIndex["Latitude"]; ok {
+			if idx, ok := colIndex["latitude"]; ok {
 				switch col := rec.Column(idx).(type) {
 				case *array.Float64:
 					consumer.Latitude = col.Value(i)
@@ -450,7 +449,7 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 				}
 			}
 
-			if idx, ok := colIndex["Longitude"]; ok {
+			if idx, ok := colIndex["longitude"]; ok {
 				switch col := rec.Column(idx).(type) {
 				case *array.Float64:
 					consumer.Longitude = col.Value(i)
