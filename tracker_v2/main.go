@@ -1708,7 +1708,7 @@ func RunDeviceTracker(runSteps []int) error {
 	}
 
 	if step4 {
-		consumerFolder := filepath.Join(outputFolder, "consumers")
+		consumerFolder := filepath.Join(outputFolder, "consumers_raw")
 		idleDevicesPath := filepath.Join(outputFolder, "Idle_devices.json")
 
 		matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath)
