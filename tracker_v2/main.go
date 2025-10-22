@@ -1666,10 +1666,11 @@ func RunDeviceTracker(runSteps []int) error {
 		Database:   "locatrix",
 		Collection: "devices_within_campaign",
 	}
+	outputFolder := "/home/device-tracker/data/output"
 
 	dt, err := NewDeviceTracker(
 		"https://locatrix-backend-development.up.railway.app/api/admin/activecampaign/list",
-		"/home/device-tracker/data/output",
+		outputFolder,
 		mongoConfig,
 	)
 	if err != nil {
@@ -1680,6 +1681,7 @@ func RunDeviceTracker(runSteps []int) error {
 	step1 := containsStep(runSteps, 1)
 	step2 := containsStep(runSteps, 2)
 	step3 := containsStep(runSteps, 3)
+	step4 := containsStep(runSteps, 4)
 
 	if step1 || step2 || step3 {
 		if err := dt.fetchCampaignsFromAPI(); err != nil {
@@ -1705,6 +1707,18 @@ func RunDeviceTracker(runSteps []int) error {
 		}
 	}
 
+	if step4 {
+		consumerFolder := filepath.Join(outputFolder, "consumers")
+		idleDevicesPath := filepath.Join(outputFolder, "Idle_devices.json")
+
+		matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath)
+
+		if err := matcher.Run(); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+
+	}
+
 	return nil
 }
 
@@ -1728,7 +1742,7 @@ func main() {
 
 	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
 	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{3} // Re-run to create proper files
+	runSteps := []int{4} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
