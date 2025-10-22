@@ -167,7 +167,6 @@ type POIMongoDocument struct {
 	CreatedAt     time.Time             `bson:"created_at"`
 }
 
-// Output structures for JSON files
 type CampaignIntersectionOutput struct {
 	ProcessedDate    string            `json:"processed_date"`
 	TotalDevices     int               `json:"total_devices"`
@@ -259,11 +258,11 @@ func (dt *DeviceTracker) initParquetWriter(dateStr string) error {
 		dt.closeParquetWriterUnsafe()
 	}
 
-	step5Folder := filepath.Join(dt.OutputFolder, "step5_time_filtered", dateStr)
-	os.MkdirAll(step5Folder, 0755)
+	timeFilteredFolder := filepath.Join(dt.OutputFolder, "time_filtered", dateStr)
+	os.MkdirAll(timeFilteredFolder, 0755)
 
 	// Format: time_filtered_loaddate20251020.parquet
-	parquetPath := filepath.Join(step5Folder, fmt.Sprintf("time_filtered_loaddate%s.parquet", dateStr))
+	parquetPath := filepath.Join(timeFilteredFolder, fmt.Sprintf("time_filtered_loaddate%s.parquet", dateStr))
 
 	file, err := os.Create(parquetPath)
 	if err != nil {
@@ -433,7 +432,7 @@ func (dt *DeviceTracker) saveToMongoDB(campaignMap map[string]map[string][]Minim
 	return nil
 }
 
-func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, step5 bool) ([]DeviceRecord, error) {
+func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step1 bool, step2 bool) ([]DeviceRecord, error) {
 	records, err := dt.readParquetOptimized(parqFilePath)
 	if err != nil {
 		return nil, err
@@ -451,7 +450,7 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, st
 	for i := range records {
 		records[i].InsertDate = insertDate
 
-		if step5 {
+		if step2 {
 			if dt.isWithinTimeFilter(records[i].EventTimestamp) {
 				tfRecord := TimeFilteredRecord{
 					DeviceID:       records[i].DeviceID,
@@ -469,7 +468,7 @@ func (dt *DeviceTracker) processCampaignFile(parqFilePath string, step3 bool, st
 			}
 		}
 
-		if step3 {
+		if step1 {
 			point := orb.Point{records[i].Longitude, records[i].Latitude}
 
 			candidates := dt.findIntersectingPolygons(records[i].Longitude, records[i].Latitude)
@@ -749,15 +748,16 @@ func (dt *DeviceTracker) fetchCampaignsFromAPI() error {
 	return nil
 }
 
-func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string, step3 bool, step5 bool) error {
-	fmt.Println("(DT) Started step 3 - Campaign Intersection")
+func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string, step1 bool, step2 bool) error {
 	startTime := time.Now()
 
-	if err := dt.fetchCampaignsFromAPI(); err != nil {
-		return fmt.Errorf("failed to fetch campaigns from API: %w", err)
-	}
+	if step1 {
+		if err := dt.fetchCampaignsFromAPI(); err != nil {
+			return fmt.Errorf("failed to fetch campaigns from API: %w", err)
+		}
 
-	dt.buildSpatialIndex()
+		dt.buildSpatialIndex()
+	}
 
 	var fileList []string
 
@@ -798,14 +798,14 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 
 	dateStr := dt.extractDateFromPath(parquetFolder)
 
-	if step5 {
+	if step2 {
 		if err := dt.initParquetWriter(dateStr); err != nil {
 			return fmt.Errorf("failed to initialize parquet writer: %w", err)
 		}
 	}
 
-	step3Folder := filepath.Join(dt.OutputFolder, "step3_campaign_intersection", dateStr)
-	os.MkdirAll(step3Folder, 0755)
+	campaignIntersectionFolder := filepath.Join(dt.OutputFolder, "campaign_intersection", dateStr)
+	os.MkdirAll(campaignIntersectionFolder, 0755)
 
 	jobs := make(chan string, len(fileList))
 	results := make(chan []DeviceRecord, workerPoolSize)
@@ -816,7 +816,7 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		go func() {
 			defer wg.Done()
 			for parqFile := range jobs {
-				records, err := dt.processCampaignFile(parqFile, step3, step5)
+				records, err := dt.processCampaignFile(parqFile, step1, step2)
 				if err != nil {
 					fmt.Printf("Error processing %s: %v\n", filepath.Base(parqFile), err)
 					continue
@@ -926,17 +926,17 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 		Campaigns:        campaigns,
 	}
 
-	jsonPath := filepath.Join(step3Folder, fmt.Sprintf("campaign_devices_%s.json", dateStr))
+	jsonPath := filepath.Join(campaignIntersectionFolder, fmt.Sprintf("campaign_devices_%s.json", dateStr))
 	if err := dt.saveJSON(jsonPath, output); err != nil {
 		return fmt.Errorf("failed to save JSON: %w", err)
 	}
 
-	fmt.Printf("(DT) Completed step 3 in %v - Saved %d devices to %s\n",
+	fmt.Printf("(DT) Completed Campaign Intersection in %v - Saved %d devices to %s\n",
 		time.Since(startTime), len(unique), jsonPath)
 
-	if step5 {
-		step5Folder := filepath.Join(dt.OutputFolder, "step5_time_filtered", dateStr)
-		os.MkdirAll(step5Folder, 0755)
+	if step2 {
+		timeFilteredFolder := filepath.Join(dt.OutputFolder, "time_filtered", dateStr)
+		os.MkdirAll(timeFilteredFolder, 0755)
 
 		timeFilterStats := TimeFilterOutput{
 			ProcessedDate:     dateStr,
@@ -948,200 +948,13 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(parquetFolder string,
 			ProcessingTimeMs:  time.Since(startTime).Milliseconds(),
 		}
 
-		statsPath := filepath.Join(step5Folder, fmt.Sprintf("time_filter_stats_%s.json", dateStr))
+		statsPath := filepath.Join(timeFilteredFolder, fmt.Sprintf("time_filter_stats_%s.json", dateStr))
 		if err := dt.saveJSON(statsPath, timeFilterStats); err != nil {
 			fmt.Printf("Warning: failed to save time filter stats: %v\n", err)
 		}
 
-		fmt.Printf("✅ Time-filtered data saved to Parquet in: %s\n", step5Folder)
+		fmt.Printf("✅ Time-filtered data saved to Parquet in: %s\n", timeFilteredFolder)
 	}
-
-	return nil
-}
-
-func (dt *DeviceTracker) MergeCampaignIntersectionsJSON(folderList []string) error {
-	fmt.Println("(DT) Started step 4 - Merge Campaign Intersections")
-	startTime := time.Now()
-
-	step4Folder := filepath.Join(dt.OutputFolder, "step4_merged_campaigns")
-	os.MkdirAll(step4Folder, 0755)
-
-	type result struct {
-		campaigns []CampaignDevices
-		date      string
-		err       error
-	}
-
-	results := make(chan result, len(folderList))
-	var wg sync.WaitGroup
-
-	for _, folder := range folderList {
-		wg.Add(1)
-		go func(f string) {
-			defer wg.Done()
-
-			dateStr := strings.TrimPrefix(f, "load_date=")
-			step3Folder := filepath.Join(dt.OutputFolder, "step3_campaign_intersection", dateStr)
-			jsonPath := filepath.Join(step3Folder, fmt.Sprintf("campaign_devices_%s.json", dateStr))
-
-			var output CampaignIntersectionOutput
-			if err := dt.loadJSON(jsonPath, &output); err != nil {
-				results <- result{nil, dateStr, err}
-				return
-			}
-
-			results <- result{output.Campaigns, dateStr, nil}
-		}(folder)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	allCampaignMap := make(map[string]map[string][]MinimalDeviceRecord)
-	allCampaignNames := make(map[string]string)
-	allPOINames := make(map[string]map[string]string)
-	var processedDates []string
-	totalDeviceCount := 0
-
-	for res := range results {
-		if res.err != nil {
-			fmt.Printf("Warning: failed to load data for date %s: %v\n", res.date, res.err)
-			continue
-		}
-
-		processedDates = append(processedDates, res.date)
-
-		for _, campaign := range res.campaigns {
-			if _, exists := allCampaignMap[campaign.CampaignID]; !exists {
-				allCampaignMap[campaign.CampaignID] = make(map[string][]MinimalDeviceRecord)
-				allPOINames[campaign.CampaignID] = make(map[string]string)
-			}
-			allCampaignNames[campaign.CampaignID] = campaign.CampaignName
-
-			for _, poi := range campaign.POIs {
-				allCampaignMap[campaign.CampaignID][poi.POIID] = append(
-					allCampaignMap[campaign.CampaignID][poi.POIID],
-					poi.Devices...,
-				)
-				allPOINames[campaign.CampaignID][poi.POIID] = poi.POIName
-				totalDeviceCount += len(poi.Devices)
-			}
-		}
-	}
-
-	allCampaigns := make([]CampaignDevices, 0, len(allCampaignMap))
-	for campaignID, poisMap := range allCampaignMap {
-		pois := make([]POIDevices, 0, len(poisMap))
-		totalDevices := 0
-
-		for poiID, devices := range poisMap {
-			pois = append(pois, POIDevices{
-				POIID:   poiID,
-				POIName: allPOINames[campaignID][poiID],
-				Devices: devices,
-				Count:   len(devices),
-			})
-			totalDevices += len(devices)
-		}
-
-		allCampaigns = append(allCampaigns, CampaignDevices{
-			CampaignID:   campaignID,
-			CampaignName: allCampaignNames[campaignID],
-			POIs:         pois,
-			TotalDevices: totalDevices,
-		})
-	}
-
-	allOutput := MergedCampaignOutput{
-		ProcessedDates:   processedDates,
-		TotalDevices:     totalDeviceCount,
-		UniqueDevices:    0,
-		TotalCampaigns:   len(allCampaigns),
-		ProcessingTimeMs: time.Since(startTime).Milliseconds(),
-		Campaigns:        allCampaigns,
-	}
-
-	allPath := filepath.Join(step4Folder, "all_campaign_devices.json")
-	if err := dt.saveJSON(allPath, allOutput); err != nil {
-		return fmt.Errorf("failed to save all devices: %w", err)
-	}
-
-	uniqueCampaignMap := make(map[string]map[string][]MinimalDeviceRecord)
-	uniqueCampaignNames := make(map[string]string)
-	uniquePOINames := make(map[string]map[string]string)
-	seen := make(map[string]struct{})
-	uniqueCount := 0
-
-	for campaignID, poisMap := range allCampaignMap {
-		if _, exists := uniqueCampaignMap[campaignID]; !exists {
-			uniqueCampaignMap[campaignID] = make(map[string][]MinimalDeviceRecord)
-			uniquePOINames[campaignID] = make(map[string]string)
-		}
-		uniqueCampaignNames[campaignID] = allCampaignNames[campaignID]
-
-		for poiID, devices := range poisMap {
-			uniquePOINames[campaignID][poiID] = allPOINames[campaignID][poiID]
-
-			for i := range devices {
-				if _, exists := seen[devices[i].DeviceID]; !exists {
-					seen[devices[i].DeviceID] = struct{}{}
-					uniqueCampaignMap[campaignID][poiID] = append(
-						uniqueCampaignMap[campaignID][poiID],
-						devices[i],
-					)
-					uniqueCount++
-				}
-			}
-		}
-	}
-
-	uniqueCampaigns := make([]CampaignDevices, 0, len(uniqueCampaignMap))
-	for campaignID, poisMap := range uniqueCampaignMap {
-		pois := make([]POIDevices, 0, len(poisMap))
-		totalDevices := 0
-
-		for poiID, devices := range poisMap {
-			if len(devices) > 0 {
-				pois = append(pois, POIDevices{
-					POIID:   poiID,
-					POIName: uniquePOINames[campaignID][poiID],
-					Devices: devices,
-					Count:   len(devices),
-				})
-				totalDevices += len(devices)
-			}
-		}
-
-		if totalDevices > 0 {
-			uniqueCampaigns = append(uniqueCampaigns, CampaignDevices{
-				CampaignID:   campaignID,
-				CampaignName: uniqueCampaignNames[campaignID],
-				POIs:         pois,
-				TotalDevices: totalDevices,
-			})
-		}
-	}
-
-	uniqueOutput := MergedCampaignOutput{
-		ProcessedDates:   processedDates,
-		TotalDevices:     totalDeviceCount,
-		UniqueDevices:    uniqueCount,
-		TotalCampaigns:   len(uniqueCampaigns),
-		ProcessingTimeMs: time.Since(startTime).Milliseconds(),
-		Campaigns:        uniqueCampaigns,
-	}
-
-	uniquePath := filepath.Join(step4Folder, "unique_campaign_devices.json")
-	if err := dt.saveJSON(uniquePath, uniqueOutput); err != nil {
-		return fmt.Errorf("failed to save unique devices: %w", err)
-	}
-
-	fmt.Printf("(DT) Completed step 4 in %v\n", time.Since(startTime))
-	fmt.Printf("  Total devices: %d\n", totalDeviceCount)
-	fmt.Printf("  Unique devices: %d\n", uniqueCount)
-	fmt.Printf("  Saved to: %s\n", step4Folder)
 
 	return nil
 }
@@ -1428,27 +1241,29 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 
 	defer dt.Close()
 
-	step3 := containsStep(runSteps, 3)
-	step5 := containsStep(runSteps, 5)
+	step1 := containsStep(runSteps, 1)
+	step2 := containsStep(runSteps, 2)
 
-	if step3 || step5 {
-		fmt.Println("\n========== Running STEP 3 & 5 ==========")
+	if step1 || step2 {
+		runningSteps := ""
+
+		if step1 && step2 {
+			runningSteps = "Campaign Intersection & Time Filtering"
+		} else if step1 {
+			runningSteps = "Campaign Intersection"
+		} else if step2 {
+			runningSteps = "Time Filtering"
+		}
+
+		fmt.Printf("\n========== Running %s ==========", runningSteps)
 		for _, folder := range folderList {
-			err := dt.FindCampaignIntersectionForFolder("/mnt/blobcontainer/"+folder, step3, step5)
+			err := dt.FindCampaignIntersectionForFolder("/mnt/blobcontainer/"+folder, step1, step2)
 			if err != nil {
-				fmt.Printf("Error in step 3/5 for %s: %v\n", folder, err)
+				fmt.Printf("Error in %s for %s: %v\n", runningSteps, folder, err)
 			}
 		}
-		fmt.Println("Step 3 & 5 Completed")
-	}
 
-	if containsStep(runSteps, 4) {
-		fmt.Println("\n========== Running STEP 4 ==========")
-		err := dt.MergeCampaignIntersectionsJSON(folderList)
-		if err != nil {
-			fmt.Printf("Error in step 4: %v\n", err)
-		}
-		fmt.Println("Step 4 Completed")
+		fmt.Printf("\n%s Completed", runningSteps)
 	}
 
 	return nil
