@@ -1500,10 +1500,18 @@ func GetLastNDatesFromYesterday(n int) []string {
 func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	yesterday := time.Now().AddDate(0, 0, -1)
-	yesterdayStr := yesterday.Format("2006-01-02")
+	//yesterday := time.Now().AddDate(0, 0, -1)
+	//yesterdayStr := yesterday.Format("2006-01-02")
 
-	dates := []string{yesterdayStr}
+	dates := []string{
+		"2025-10-21",
+		"2025-10-20",
+		"2025-10-19",
+		"2025-10-18",
+		"2025-10-17",
+		"2025-10-16",
+		"2025-10-15",
+	}
 
 	folderList := make([]string, 0, len(dates))
 	for _, d := range dates {
@@ -1594,7 +1602,7 @@ func main() {
 	// IMPORTANT: Run steps in order!
 	// First time: runSteps := []int{1, 2}  // Creates campaign + time-filtered data
 	// Second time: runSteps := []int{3}    // Finds idle devices
-	runSteps := []int{1, 2, 3} // Change to []int{3} after Step 1 & 2 complete
+	runSteps := []int{1, 2} // Change to []int{3} after Step 1 & 2 complete
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
