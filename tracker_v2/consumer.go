@@ -380,6 +380,8 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquet(fpath string) ([]Cons
 		states := cdm.readStringColumnRaw(rg, colIndex["State"], numRows)
 		zips := cdm.readStringColumnRaw(rg, colIndex["ZipCode"], numRows)
 
+		log.Println(lats, lons)
+
 		// Build records
 		for i := 0; i < numRows; i++ {
 			// Validate coordinates
