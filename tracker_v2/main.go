@@ -1630,12 +1630,12 @@ func RunDeviceTracker(runSteps []int) error {
 
 	dates := []string{
 		"2025-10-21",
-		"2025-10-20",
+		/*"2025-10-20",
 		"2025-10-19",
 		"2025-10-18",
 		"2025-10-17",
 		"2025-10-16",
-		"2025-10-15",
+		"2025-10-15",*/
 	}
 
 	folderList := make([]string, 0, len(dates))
@@ -1713,7 +1713,7 @@ func main() {
 
 	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
 	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{1, 2} // Re-run to create proper files
+	runSteps := []int{2} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
