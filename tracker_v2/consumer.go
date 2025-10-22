@@ -211,7 +211,7 @@ func (cdm *ConsumerDeviceMatcher) createBufferPolygon(lat, lon, radiusMeters flo
 func (cdm *ConsumerDeviceMatcher) processConsumerFiles() error {
 	cdm.logger.Println("Finding consumer parquet files...")
 
-	pattern := filepath.Join(cdm.consumerFolder, "consumers_chunk_*.parquet")
+	pattern := filepath.Join(cdm.consumerFolder, "*.parquet")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
 		return err
