@@ -1224,7 +1224,7 @@ func RunDeviceTracker(runSteps []int) error {
 		yesterdayStr, // "2025-10-21",
 	}
 
-	folderList := make([]string, 0, len(dates))
+	folderList := make([]string, 0, len(GetLastNDatesFromYesterday(7)))
 	for _, d := range dates {
 		folder := "load_date=" + strings.ReplaceAll(d, "-", "")
 		folderList = append(folderList, folder)
