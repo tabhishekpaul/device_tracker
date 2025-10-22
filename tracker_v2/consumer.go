@@ -7,10 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow/go/v14/arrow/array"
@@ -23,13 +21,9 @@ import (
 
 const (
 	MatchRadiusMeters = 30.0
-	ParallelWorkers   = 12
-	GridSize          = 0.001 // ~111 meters per cell
+	ParallelWorkers   = 1 // Single worker for debugging
+	GridSize          = 0.001
 )
-
-// ============================================================================
-// TYPES
-// ============================================================================
 
 type ConsumerRecord struct {
 	ID              uint64
@@ -71,35 +65,16 @@ type ConsumerDeviceMatch struct {
 	Campaign    string `json:"Campaign"`
 }
 
-type MatchOutputJSON struct {
-	ProcessedDate    string                `json:"processed_date"`
-	TotalMatches     int                   `json:"total_matches"`
-	UniqueDevices    int                   `json:"unique_devices"`
-	UniqueConsumers  int                   `json:"unique_consumers"`
-	ProcessingTimeMs int64                 `json:"processing_time_ms"`
-	Matches          []ConsumerDeviceMatch `json:"matches"`
-}
-
 type ConsumerDeviceMatcher struct {
-	outputFolder    string
-	consumerFolder  string
-	idleDevicesPath string
-	logger          *log.Logger
-
-	// Spatial index: grid cell key -> idle devices in that cell
+	outputFolder       string
+	consumerFolder     string
+	idleDevicesPath    string
+	logger             *log.Logger
 	deviceSpatialIndex map[int64][]IdleDevice
 	indexMutex         sync.RWMutex
-
-	// Results
-	matches        []ConsumerDeviceMatch
-	matchesMutex   sync.Mutex
-	matchedDevices map[string]bool // Track matched devices
-
-	// Stats
-	totalMatches      atomic.Int64
-	processedFiles    atomic.Int64
-	uniqueDeviceSet   map[string]bool
-	uniqueConsumerSet map[uint64]bool
+	matches            []ConsumerDeviceMatch
+	matchesMutex       sync.Mutex
+	matchedDevices     map[string]bool
 }
 
 func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath string) *ConsumerDeviceMatcher {
@@ -107,18 +82,12 @@ func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath stri
 		outputFolder:       outputFolder,
 		consumerFolder:     consumerFolder,
 		idleDevicesPath:    idleDevicesPath,
-		logger:             log.New(os.Stdout, "[Step4] ", log.LstdFlags),
+		logger:             log.New(os.Stdout, "[DEBUG] ", log.LstdFlags),
 		deviceSpatialIndex: make(map[int64][]IdleDevice),
 		matches:            make([]ConsumerDeviceMatch, 0),
 		matchedDevices:     make(map[string]bool),
-		uniqueDeviceSet:    make(map[string]bool),
-		uniqueConsumerSet:  make(map[uint64]bool),
 	}
 }
-
-// ============================================================================
-// SPATIAL INDEX HELPERS
-// ============================================================================
 
 func getCellKey(lat, lon float64) int64 {
 	cellX := int64(lon / GridSize)
@@ -127,14 +96,11 @@ func getCellKey(lat, lon float64) int64 {
 }
 
 func getNearbyCells(lat, lon, radiusMeters float64) []int64 {
-	// Calculate search radius in grid cells
 	searchRadius := int((radiusMeters/111000.0)/GridSize) + 1
-
 	centerX := int64(lon / GridSize)
 	centerY := int64(lat / GridSize)
 
-	cells := make([]int64, 0, (2*searchRadius+1)*(2*searchRadius+1))
-
+	cells := make([]int64, 0)
 	for dx := -searchRadius; dx <= searchRadius; dx++ {
 		for dy := -searchRadius; dy <= searchRadius; dy++ {
 			cellX := centerX + int64(dx)
@@ -142,16 +108,13 @@ func getNearbyCells(lat, lon, radiusMeters float64) []int64 {
 			cells = append(cells, cellX*1000000+cellY)
 		}
 	}
-
 	return cells
 }
 
-// ============================================================================
-// LOAD IDLE DEVICES & BUILD SPATIAL INDEX
-// ============================================================================
-
 func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
-	cdm.logger.Println("Loading idle devices from JSON...")
+	cdm.logger.Println("╔═══════════════════════════════════════════════════════╗")
+	cdm.logger.Println("║  LOADING IDLE DEVICES - DEBUG MODE                   ║")
+	cdm.logger.Println("╚═══════════════════════════════════════════════════════╝")
 
 	file, err := os.Open(cdm.idleDevicesPath)
 	if err != nil {
@@ -177,10 +140,25 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 	}
 
 	totalDevices := 0
+	sampleCount := 0
 
 	for date, devices := range idleData.IdleDevicesByDate {
+		cdm.logger.Printf("\n📅 Date: %s (%d devices)", date, len(devices))
+
 		for _, device := range devices {
 			lat, lon := cdm.parsePoint(device.Geometry)
+
+			// Show first 3 devices as samples
+			if sampleCount < 3 {
+				cdm.logger.Printf("  Sample Device #%d:", sampleCount+1)
+				cdm.logger.Printf("    DeviceID:    %s", device.DeviceID)
+				cdm.logger.Printf("    VisitedTime: %s", device.VisitedTime)
+				cdm.logger.Printf("    Address:     %s", device.Address)
+				cdm.logger.Printf("    Campaign:    %s", device.Campaign)
+				cdm.logger.Printf("    Lat/Lon:     %.6f, %.6f", lat, lon)
+				cdm.logger.Printf("    Grid Cell:   %d", getCellKey(lat, lon))
+				sampleCount++
+			}
 
 			idleDevice := IdleDevice{
 				DeviceID:    device.DeviceID,
@@ -193,16 +171,37 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 				Longitude:   lon,
 			}
 
-			// Add to spatial index
 			cellKey := getCellKey(lat, lon)
 			cdm.deviceSpatialIndex[cellKey] = append(cdm.deviceSpatialIndex[cellKey], idleDevice)
 			totalDevices++
 		}
-		cdm.logger.Printf("  Loaded %d devices from date %s", len(devices), date)
 	}
 
-	cdm.logger.Printf("✅ Total idle devices loaded: %d", totalDevices)
-	cdm.logger.Printf("✅ Spatial index created: %d grid cells", len(cdm.deviceSpatialIndex))
+	cdm.logger.Printf("\n✅ Total idle devices loaded: %d", totalDevices)
+	cdm.logger.Printf("✅ Spatial index cells: %d", len(cdm.deviceSpatialIndex))
+
+	// Show grid cell distribution
+	cdm.logger.Println("\n📊 Grid Cell Distribution (top 10):")
+	type cellInfo struct {
+		key   int64
+		count int
+	}
+	cells := make([]cellInfo, 0, len(cdm.deviceSpatialIndex))
+	for k, v := range cdm.deviceSpatialIndex {
+		cells = append(cells, cellInfo{k, len(v)})
+	}
+	// Sort by count
+	for i := 0; i < len(cells)-1; i++ {
+		for j := i + 1; j < len(cells); j++ {
+			if cells[j].count > cells[i].count {
+				cells[i], cells[j] = cells[j], cells[i]
+			}
+		}
+	}
+	for i := 0; i < 10 && i < len(cells); i++ {
+		cdm.logger.Printf("  Cell %d: %d devices", cells[i].key, cells[i].count)
+	}
+
 	return nil
 }
 
@@ -215,19 +214,15 @@ func (cdm *ConsumerDeviceMatcher) parsePoint(geometryStr string) (float64, float
 	return lat, lon
 }
 
-// ============================================================================
-// FIND NEARBY DEVICES FOR A CONSUMER (FAST SPATIAL LOOKUP)
-// ============================================================================
-
 func (cdm *ConsumerDeviceMatcher) findNearbyDevices(consumerLat, consumerLon float64) []IdleDevice {
 	consumerPoint := orb.Point{consumerLon, consumerLat}
-
-	// Get nearby cells
 	cells := getNearbyCells(consumerLat, consumerLon, MatchRadiusMeters)
 
 	nearbyDevices := make([]IdleDevice, 0)
 
 	cdm.indexMutex.RLock()
+	defer cdm.indexMutex.RUnlock()
+
 	for _, cellKey := range cells {
 		if devices, exists := cdm.deviceSpatialIndex[cellKey]; exists {
 			for _, device := range devices {
@@ -240,17 +235,14 @@ func (cdm *ConsumerDeviceMatcher) findNearbyDevices(consumerLat, consumerLon flo
 			}
 		}
 	}
-	cdm.indexMutex.RUnlock()
 
 	return nearbyDevices
 }
 
-// ============================================================================
-// PROCESS CONSUMER PARQUET FILES IN PARALLEL
-// ============================================================================
-
 func (cdm *ConsumerDeviceMatcher) processConsumerFiles() error {
-	cdm.logger.Println("Finding consumer parquet files...")
+	cdm.logger.Println("\n╔═══════════════════════════════════════════════════════╗")
+	cdm.logger.Println("║  PROCESSING CONSUMER FILES - DEBUG MODE               ║")
+	cdm.logger.Println("╚═══════════════════════════════════════════════════════╝")
 
 	patterns := []string{
 		filepath.Join(cdm.consumerFolder, "consumers_chunk_*.parquet"),
@@ -277,82 +269,78 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFiles() error {
 		return fmt.Errorf("no consumer parquet files found in %s", cdm.consumerFolder)
 	}
 
-	cdm.logger.Printf("Found %d consumer parquet files", len(files))
-	cdm.logger.Printf("Processing with %d parallel workers...\n", ParallelWorkers)
+	cdm.logger.Printf("\nFound %d consumer parquet files", len(files))
+	cdm.logger.Println("Processing FIRST FILE ONLY for debugging...")
 
-	fileChan := make(chan string, len(files))
-	for _, f := range files {
-		fileChan <- f
+	// Process only first file for debugging
+	if len(files) > 0 {
+		fpath := files[0]
+		matches, err := cdm.processConsumerFileDebug(fpath)
+		if err != nil {
+			return err
+		}
+
+		cdm.logger.Printf("\n✅ File processed: %d matches found", len(matches))
+		cdm.matches = append(cdm.matches, matches...)
 	}
-	close(fileChan)
-
-	var wg sync.WaitGroup
-	startTime := time.Now()
-
-	for w := 0; w < ParallelWorkers; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			for fpath := range fileChan {
-				fileStartTime := time.Now()
-
-				matches, err := cdm.processConsumerFile(fpath)
-				if err != nil {
-					cdm.logger.Printf("[W%d] Error processing %s: %v", workerID, filepath.Base(fpath), err)
-					continue
-				}
-
-				if len(matches) > 0 {
-					cdm.matchesMutex.Lock()
-					cdm.matches = append(cdm.matches, matches...)
-					cdm.matchesMutex.Unlock()
-
-					cdm.totalMatches.Add(int64(len(matches)))
-				}
-
-				cdm.processedFiles.Add(1)
-				elapsed := time.Since(fileStartTime)
-
-				cdm.logger.Printf("[W%d] %s: %d matches (%.1fs) | Total: %d/%d files, %d matches",
-					workerID, filepath.Base(fpath), len(matches), elapsed.Seconds(),
-					cdm.processedFiles.Load(), len(files), cdm.totalMatches.Load())
-
-				runtime.GC()
-			}
-		}(w)
-	}
-
-	wg.Wait()
-
-	elapsed := time.Since(startTime)
-	cdm.logger.Printf("\n✅ All files processed in %.2f seconds", elapsed.Seconds())
-	cdm.logger.Printf("   Total matches found: %d", cdm.totalMatches.Load())
 
 	return nil
 }
 
-// ============================================================================
-// PROCESS SINGLE CONSUMER FILE (OPTIMIZED)
-// ============================================================================
+func (cdm *ConsumerDeviceMatcher) processConsumerFileDebug(fpath string) ([]ConsumerDeviceMatch, error) {
+	cdm.logger.Printf("📂 Processing: %s\n", filepath.Base(fpath))
 
-func (cdm *ConsumerDeviceMatcher) processConsumerFile(fpath string) ([]ConsumerDeviceMatch, error) {
 	consumers, err := cdm.readConsumersFromParquetArrow(fpath)
 	if err != nil {
 		return nil, err
 	}
 
+	cdm.logger.Printf("✅ Loaded %d consumers from file\n", len(consumers))
+
 	if len(consumers) == 0 {
+		cdm.logger.Println("⚠️  No consumers found in file!")
 		return nil, nil
 	}
 
-	matches := make([]ConsumerDeviceMatch, 0)
+	// Show first 5 consumers
+	cdm.logger.Println("📋 Sample Consumers:")
+	for i := 0; i < 5 && i < len(consumers); i++ {
+		c := consumers[i]
+		cdm.logger.Printf("  Consumer #%d:", i+1)
+		cdm.logger.Printf("    ID:       %d", c.ID)
+		cdm.logger.Printf("    Name:     %s %s", c.PersonFirstName, c.PersonLastName)
+		cdm.logger.Printf("    Address:  %s", c.PrimaryAddress)
+		cdm.logger.Printf("    Lat/Lon:  %.6f, %.6f", c.Latitude, c.Longitude)
+		cdm.logger.Printf("    Grid Cell: %d", getCellKey(c.Latitude, c.Longitude))
 
-	// For each consumer, find nearby devices using spatial index
-	for _, consumer := range consumers {
+		// Check for nearby devices
+		nearby := cdm.findNearbyDevices(c.Latitude, c.Longitude)
+		cdm.logger.Printf("    Nearby devices: %d", len(nearby))
+		if len(nearby) > 0 {
+			cdm.logger.Printf("    ✅ MATCH POSSIBLE!")
+			for j, d := range nearby {
+				if j < 2 {
+					devicePoint := orb.Point{d.Longitude, d.Latitude}
+					consumerPoint := orb.Point{c.Longitude, c.Latitude}
+					distance := geo.Distance(consumerPoint, devicePoint)
+					cdm.logger.Printf("      Device: %s (distance: %.2fm)", d.DeviceID, distance)
+				}
+			}
+		}
+	}
+
+	matches := make([]ConsumerDeviceMatch, 0)
+	matchCount := 0
+
+	cdm.logger.Println("\n🔍 Searching for matches...")
+
+	for idx, consumer := range consumers {
+		if idx%10000 == 0 && idx > 0 {
+			cdm.logger.Printf("  Processed %d consumers, %d matches so far...", idx, matchCount)
+		}
+
 		nearbyDevices := cdm.findNearbyDevices(consumer.Latitude, consumer.Longitude)
 
-		// Match with first unmatched device
 		for _, device := range nearbyDevices {
 			cdm.matchesMutex.Lock()
 			alreadyMatched := cdm.matchedDevices[device.DeviceID]
@@ -365,7 +353,6 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFile(fpath string) ([]ConsumerD
 				continue
 			}
 
-			// Create match
 			datePart, timePart := cdm.splitDateTime(device.VisitedTime)
 
 			match := ConsumerDeviceMatch{
@@ -384,16 +371,24 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFile(fpath string) ([]ConsumerD
 			}
 
 			matches = append(matches, match)
-			break // Only first device per consumer
+			matchCount++
+
+			if matchCount <= 5 {
+				cdm.logger.Printf("\n🎯 MATCH FOUND #%d:", matchCount)
+				cdm.logger.Printf("  Device: %s at %.6f, %.6f", device.DeviceID, device.Latitude, device.Longitude)
+				cdm.logger.Printf("  Consumer: %d (%s) at %.6f, %.6f", consumer.ID, match.Name, consumer.Latitude, consumer.Longitude)
+				devicePoint := orb.Point{device.Longitude, device.Latitude}
+				consumerPoint := orb.Point{consumer.Longitude, consumer.Latitude}
+				distance := geo.Distance(consumerPoint, devicePoint)
+				cdm.logger.Printf("  Distance: %.2f meters", distance)
+			}
+
+			break
 		}
 	}
 
 	return matches, nil
 }
-
-// ============================================================================
-// READ CONSUMERS FROM PARQUET
-// ============================================================================
 
 func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([]ConsumerRecord, error) {
 	f, err := os.Open(fpath)
@@ -518,54 +513,6 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 	return consumers, nil
 }
 
-// ============================================================================
-// SAVE RESULTS
-// ============================================================================
-
-func (cdm *ConsumerDeviceMatcher) saveMatches(processedDate string, processingTimeMs int64) error {
-	cdm.logger.Println("\nSaving matches...")
-
-	for _, match := range cdm.matches {
-		cdm.uniqueDeviceSet[match.DeviceID] = true
-		cdm.uniqueConsumerSet[match.ConsumerID] = true
-	}
-
-	output := MatchOutputJSON{
-		ProcessedDate:    processedDate,
-		TotalMatches:     len(cdm.matches),
-		UniqueDevices:    len(cdm.uniqueDeviceSet),
-		UniqueConsumers:  len(cdm.uniqueConsumerSet),
-		ProcessingTimeMs: processingTimeMs,
-		Matches:          cdm.matches,
-	}
-
-	outputPath := filepath.Join(cdm.outputFolder, "consumer_device_matches", fmt.Sprintf("matches_%s.json", processedDate))
-	os.MkdirAll(filepath.Dir(outputPath), 0755)
-
-	file, err := os.Create(outputPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(output); err != nil {
-		return err
-	}
-
-	cdm.logger.Printf("✅ Saved to: %s", outputPath)
-	cdm.logger.Printf("   Total matches: %d", output.TotalMatches)
-	cdm.logger.Printf("   Unique devices: %d", output.UniqueDevices)
-	cdm.logger.Printf("   Unique consumers: %d", output.UniqueConsumers)
-
-	return nil
-}
-
-// ============================================================================
-// HELPERS
-// ============================================================================
-
 func (cdm *ConsumerDeviceMatcher) splitDateTime(visitedTime string) (string, string) {
 	parts := strings.Split(visitedTime, " ")
 	if len(parts) >= 2 {
@@ -581,15 +528,7 @@ func (cdm *ConsumerDeviceMatcher) buildName(firstName, lastName string) string {
 	return strings.TrimSpace(firstName + " " + lastName)
 }
 
-// ============================================================================
-// MAIN
-// ============================================================================
-
 func (cdm *ConsumerDeviceMatcher) Run() error {
-	cdm.logger.Println("╔═══════════════════════════════════════════════════════╗")
-	cdm.logger.Println("║  STEP 4: CONSUMER-DEVICE MATCHING (OPTIMIZED)        ║")
-	cdm.logger.Println("╚═══════════════════════════════════════════════════════╝")
-
 	startTime := time.Now()
 
 	if err := cdm.loadIdleDevices(); err != nil {
@@ -602,14 +541,11 @@ func (cdm *ConsumerDeviceMatcher) Run() error {
 
 	elapsed := time.Since(startTime)
 
-	processedDate := time.Now().Format("2006-01-02")
-	if err := cdm.saveMatches(processedDate, elapsed.Milliseconds()); err != nil {
-		return fmt.Errorf("failed to save matches: %w", err)
-	}
-
 	cdm.logger.Printf("\n╔═══════════════════════════════════════════════════════╗")
-	cdm.logger.Printf("║  ✅ STEP 4 COMPLETED IN %.2f seconds", elapsed.Seconds())
+	cdm.logger.Printf("║  DEBUG SUMMARY")
 	cdm.logger.Printf("╚═══════════════════════════════════════════════════════╝")
+	cdm.logger.Printf("Total matches found: %d", len(cdm.matches))
+	cdm.logger.Printf("Time elapsed: %.2f seconds", elapsed.Seconds())
 
 	return nil
 }
