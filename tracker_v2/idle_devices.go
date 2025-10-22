@@ -16,11 +16,8 @@ import (
 )
 
 // ============================================================================
-// STEP 3: STREAMING ROW-GROUP PROCESSING (FIXED IDLE DETECTION)
-// - Process parquet ROW GROUPS one at a time
-// - Keep device states across ALL row groups
-// - Save idle devices only at the END
-// - Never load entire parquet into memory
+// STEP 3: STREAMING IDLE DEVICE DETECTION (PROPERLY FILTERED)
+// KEY FIX: Only process devices that are in campaign metadata (like Python)
 // ============================================================================
 
 // CampaignMetadata holds the campaign info for a device
@@ -48,7 +45,7 @@ type IdleDeviceResult struct {
 type DeviceTrackingState struct {
 	FirstPoint  orb.Point
 	FirstTime   time.Time
-	IsStillIdle bool // Still within buffer
+	IsStillIdle bool
 	RecordCount int
 }
 
@@ -106,7 +103,7 @@ func (dt *DeviceTracker) RunIdleDeviceSearch(folderList []string, targetDates []
 }
 
 // ============================================================================
-// STREAMING ROW-GROUP PROCESSING (FIXED LOGIC)
+// STREAMING ROW-GROUP PROCESSING WITH PROPER FILTERING
 // ============================================================================
 
 // FindIdleDevicesStreamingByDate processes parquet row groups one-by-one
@@ -120,7 +117,15 @@ func (dt *DeviceTracker) FindIdleDevicesStreamingByDate(folderList []string, tar
 	}
 	fmt.Printf("  📋 Loaded metadata for %d devices\n", len(campaignMetadata))
 
+	// Create lookup set for fast filtering (KEY FIX)
+	campaignDeviceSet := make(map[string]bool, len(campaignMetadata))
+	for deviceID := range campaignMetadata {
+		campaignDeviceSet[deviceID] = true
+	}
+	fmt.Printf("  🔍 Will filter for %d campaign devices only\n", len(campaignDeviceSet))
+
 	totalProcessed := 0
+	totalFiltered := 0
 	totalIdle := 0
 
 	// Process each parquet file
@@ -139,56 +144,65 @@ func (dt *DeviceTracker) FindIdleDevicesStreamingByDate(folderList []string, tar
 
 		fmt.Printf("    📂 Processing: %s\n", filepath.Base(parquetPath))
 
-		// STREAMING: Process row groups one at a time
-		idleCount, recordCount, err := dt.processParquetFileStreaming(parquetPath, campaignMetadata)
+		// STREAMING with filtering: Process row groups one at a time
+		idleCount, recordCount, filteredCount, err := dt.processParquetFileStreaming(
+			parquetPath,
+			campaignMetadata,
+			campaignDeviceSet,
+		)
 		if err != nil {
 			fmt.Printf("    ⚠️  Error: %v\n", err)
 			continue
 		}
 
 		totalProcessed += recordCount
+		totalFiltered += filteredCount
 		totalIdle += idleCount
 
-		fmt.Printf("    ✓ Processed: %d records, Found: %d idle devices\n", recordCount, idleCount)
+		fmt.Printf("    ✓ Total: %d records, Filtered: %d campaign devices, Found: %d idle\n",
+			recordCount, filteredCount, idleCount)
 
 		// Force GC after each file
 		runtime.GC()
 	}
 
 	duration := time.Since(startTime)
-	fmt.Printf("  ✅ Total: %d records processed, %d idle devices found in %v\n", totalProcessed, totalIdle, duration)
+	fmt.Printf("  ✅ Total: %d records → %d campaign devices → %d idle devices in %v\n",
+		totalProcessed, totalFiltered, totalIdle, duration)
 
 	return nil
 }
 
-// processParquetFileStreaming - Process row groups one at a time, keep states until end
+// processParquetFileStreaming - Process row groups with filtering
 func (dt *DeviceTracker) processParquetFileStreaming(
 	parquetPath string,
 	campaignMetadata map[string]CampaignMetadata,
-) (int, int, error) {
+	campaignDeviceSet map[string]bool,
+) (int, int, int, error) {
 
 	// Open parquet file
 	pf, err := file.OpenParquetFile(parquetPath, false)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer pf.Close()
 
 	numRowGroups := pf.NumRowGroups()
 	if numRowGroups == 0 {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 
 	fmt.Printf("      📊 File has %d row groups\n", numRowGroups)
 
-	// Device tracking state persists across ALL row groups (FIX: Don't clear until end)
+	// Device tracking state persists across ALL row groups
 	deviceStates := make(map[string]*DeviceTrackingState)
 	totalRecords := 0
+	filteredRecords := 0
 
 	// Process each row group sequentially
 	for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
 		if rgIdx%50 == 0 || rgIdx == numRowGroups-1 {
-			fmt.Printf("      🔄 Processing row group %d/%d (tracking %d devices)...\n",
+			fmt.Printf("      🔄 Row group %d/%d (tracking %d campaign devices)...\n",
 				rgIdx+1, numRowGroups, len(deviceStates))
 		}
 
@@ -201,8 +215,13 @@ func (dt *DeviceTracker) processParquetFileStreaming(
 
 		totalRecords += len(records)
 
-		// Update device states with records from this row group
-		dt.updateDeviceStates(deviceStates, records, campaignMetadata)
+		// FILTER: Only keep records for devices in campaign metadata (like Python idFilter)
+		filteredRecords += dt.updateDeviceStatesFiltered(
+			deviceStates,
+			records,
+			campaignMetadata,
+			campaignDeviceSet,
+		)
 
 		// Release row group memory
 		records = nil
@@ -213,34 +232,39 @@ func (dt *DeviceTracker) processParquetFileStreaming(
 		}
 	}
 
-	fmt.Printf("      ✅ Finished processing all row groups. Analyzing %d tracked devices...\n", len(deviceStates))
+	fmt.Printf("      ✅ Processed %d row groups. Filtered %d/%d records. Analyzing %d devices...\n",
+		numRowGroups, filteredRecords, totalRecords, len(deviceStates))
 
-	// NOW save idle devices (only at the end after processing all row groups)
+	// Save idle devices at the end
 	idleDeviceCount := dt.saveIdleDevicesFromStates(deviceStates, campaignMetadata)
 
 	// Clear all states
 	deviceStates = nil
 	runtime.GC()
 
-	return idleDeviceCount, totalRecords, nil
+	return idleDeviceCount, totalRecords, filteredRecords, nil
 }
 
-// updateDeviceStates updates tracking state for devices in this row group
-func (dt *DeviceTracker) updateDeviceStates(
+// updateDeviceStatesFiltered - KEY FIX: Filter records by campaign device set
+func (dt *DeviceTracker) updateDeviceStatesFiltered(
 	deviceStates map[string]*DeviceTrackingState,
 	records []DeviceRecord,
 	campaignMetadata map[string]CampaignMetadata,
-) {
+	campaignDeviceSet map[string]bool,
+) int {
 	bufferMeters := dt.IdleDeviceBuffer
+	filteredCount := 0
 
 	for i := range records {
 		record := &records[i]
 		deviceID := record.DeviceID
 
-		// Only track devices that are in campaign metadata
-		if _, exists := campaignMetadata[deviceID]; !exists {
+		// KEY FIX: Filter - only process devices in campaign metadata (like Python)
+		if !campaignDeviceSet[deviceID] {
 			continue
 		}
+
+		filteredCount++
 
 		state, exists := deviceStates[deviceID]
 		if !exists {
@@ -266,9 +290,11 @@ func (dt *DeviceTracker) updateDeviceStates(
 		}
 		state.RecordCount++
 	}
+
+	return filteredCount
 }
 
-// saveIdleDevicesFromStates - NEW: Save idle devices after processing all row groups
+// saveIdleDevicesFromStates - Save idle devices after processing all row groups
 func (dt *DeviceTracker) saveIdleDevicesFromStates(
 	deviceStates map[string]*DeviceTrackingState,
 	campaignMetadata map[string]CampaignMetadata,
@@ -278,6 +304,7 @@ func (dt *DeviceTracker) saveIdleDevicesFromStates(
 
 	// Collect idle devices (devices that stayed within buffer with 2+ records)
 	for deviceID, state := range deviceStates {
+		// Must have at least 2 records and stayed idle
 		if state.IsStillIdle && state.RecordCount >= 2 {
 			metadata, exists := campaignMetadata[deviceID]
 			if !exists {
@@ -309,7 +336,7 @@ func (dt *DeviceTracker) saveIdleDevicesFromStates(
 		}
 		fmt.Printf("      💾 Saved %d idle devices to JSON files\n", savedCount)
 	} else {
-		fmt.Printf("      ⚠️  No idle devices found\n")
+		fmt.Printf("      ⚠️  No idle devices found (all devices moved outside buffer)\n")
 	}
 
 	return savedCount
@@ -414,7 +441,7 @@ func (dt *DeviceTracker) MergeIdleDevicesByEventDate() error {
 
 	if len(files) == 0 {
 		fmt.Println("  ⚠️  No idle device files found - no idle devices detected")
-		return nil // Not an error, just no idle devices found
+		return nil
 	}
 
 	fmt.Printf("  📂 Found %d event date files to merge\n", len(files))
@@ -474,7 +501,7 @@ func (dt *DeviceTracker) MergeIdleDevicesByEventDate() error {
 // JSON METADATA LOADING (FROM STEP 1 OUTPUT)
 // ============================================================================
 
-// GetUniqIdDataFrame loads unique device metadata from JSON file for specific target date
+// GetUniqIdDataFrame loads unique device metadata from JSON file
 func (dt *DeviceTracker) GetUniqIdDataFrame() (map[string]CampaignMetadata, error) {
 	yesterday := time.Now().AddDate(0, 0, -1)
 	dateStr := yesterday.Format("20060102")
