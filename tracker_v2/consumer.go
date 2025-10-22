@@ -8,20 +8,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/apache/arrow/go/v14/arrow/array"
 	"github.com/apache/arrow/go/v14/arrow/memory"
 	"github.com/apache/arrow/go/v14/parquet/file"
 	"github.com/apache/arrow/go/v14/parquet/pqarrow"
-	"github.com/paulmach/orb"
-	"github.com/paulmach/orb/geo"
 )
 
 const (
 	MatchRadiusMeters = 30.0
-	ParallelWorkers   = 1 // Single worker for debugging
 	GridSize          = 0.001
 )
 
@@ -44,25 +40,19 @@ type IdleDevice struct {
 	VisitedTime string
 	Address     string
 	Campaign    string
-	CampaignID  string
-	POIID       string
 	Latitude    float64
 	Longitude   float64
 }
 
-type ConsumerDeviceMatch struct {
-	DeviceID    string `json:"DeviceID"`
-	DateVisited string `json:"Date visited"`
-	TimeVisited string `json:"Time visited"`
-	ConsumerID  uint64 `json:"ConsumerID"`
-	Name        string `json:"Name"`
-	Address     string `json:"Address"`
-	Email       string `json:"Email"`
-	CityName    string `json:"CityName"`
-	State       string `json:"State"`
-	ZipCode     string `json:"ZipCode"`
-	POI         string `json:"POI"`
-	Campaign    string `json:"Campaign"`
+type CoordinateStats struct {
+	TotalConsumers    int64
+	ValidCoords       int64
+	InvalidZeroZero   int64
+	OutOfBoundsLat    int64
+	OutOfBoundsLon    int64
+	MinLat, MaxLat    float64
+	MinLon, MaxLon    float64
+	SampleValidCoords []ConsumerRecord
 }
 
 type ConsumerDeviceMatcher struct {
@@ -71,10 +61,7 @@ type ConsumerDeviceMatcher struct {
 	idleDevicesPath    string
 	logger             *log.Logger
 	deviceSpatialIndex map[int64][]IdleDevice
-	indexMutex         sync.RWMutex
-	matches            []ConsumerDeviceMatch
-	matchesMutex       sync.Mutex
-	matchedDevices     map[string]bool
+	stats              CoordinateStats
 }
 
 func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath string) *ConsumerDeviceMatcher {
@@ -82,10 +69,15 @@ func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath stri
 		outputFolder:       outputFolder,
 		consumerFolder:     consumerFolder,
 		idleDevicesPath:    idleDevicesPath,
-		logger:             log.New(os.Stdout, "[DEBUG] ", log.LstdFlags),
+		logger:             log.New(os.Stdout, "[DETAILED-DEBUG] ", log.LstdFlags),
 		deviceSpatialIndex: make(map[int64][]IdleDevice),
-		matches:            make([]ConsumerDeviceMatch, 0),
-		matchedDevices:     make(map[string]bool),
+		stats: CoordinateStats{
+			MinLat:            90.0,
+			MaxLat:            -90.0,
+			MinLon:            180.0,
+			MaxLon:            -180.0,
+			SampleValidCoords: make([]ConsumerRecord, 0, 10),
+		},
 	}
 }
 
@@ -95,25 +87,9 @@ func getCellKey(lat, lon float64) int64 {
 	return cellX*1000000 + cellY
 }
 
-func getNearbyCells(lat, lon, radiusMeters float64) []int64 {
-	searchRadius := int((radiusMeters/111000.0)/GridSize) + 1
-	centerX := int64(lon / GridSize)
-	centerY := int64(lat / GridSize)
-
-	cells := make([]int64, 0)
-	for dx := -searchRadius; dx <= searchRadius; dx++ {
-		for dy := -searchRadius; dy <= searchRadius; dy++ {
-			cellX := centerX + int64(dx)
-			cellY := centerY + int64(dy)
-			cells = append(cells, cellX*1000000+cellY)
-		}
-	}
-	return cells
-}
-
 func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 	cdm.logger.Println("╔═══════════════════════════════════════════════════════╗")
-	cdm.logger.Println("║  LOADING IDLE DEVICES - DEBUG MODE                   ║")
+	cdm.logger.Println("║  LOADING IDLE DEVICES                                 ║")
 	cdm.logger.Println("╚═══════════════════════════════════════════════════════╝")
 
 	file, err := os.Open(cdm.idleDevicesPath)
@@ -140,33 +116,16 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 	}
 
 	totalDevices := 0
-	sampleCount := 0
 
-	for date, devices := range idleData.IdleDevicesByDate {
-		cdm.logger.Printf("\n📅 Date: %s (%d devices)", date, len(devices))
-
+	for _, devices := range idleData.IdleDevicesByDate {
 		for _, device := range devices {
 			lat, lon := cdm.parsePoint(device.Geometry)
-
-			// Show first 3 devices as samples
-			if sampleCount < 3 {
-				cdm.logger.Printf("  Sample Device #%d:", sampleCount+1)
-				cdm.logger.Printf("    DeviceID:    %s", device.DeviceID)
-				cdm.logger.Printf("    VisitedTime: %s", device.VisitedTime)
-				cdm.logger.Printf("    Address:     %s", device.Address)
-				cdm.logger.Printf("    Campaign:    %s", device.Campaign)
-				cdm.logger.Printf("    Lat/Lon:     %.6f, %.6f", lat, lon)
-				cdm.logger.Printf("    Grid Cell:   %d", getCellKey(lat, lon))
-				sampleCount++
-			}
 
 			idleDevice := IdleDevice{
 				DeviceID:    device.DeviceID,
 				VisitedTime: device.VisitedTime,
 				Address:     device.Address,
 				Campaign:    device.Campaign,
-				CampaignID:  device.CampaignID,
-				POIID:       device.POIID,
 				Latitude:    lat,
 				Longitude:   lon,
 			}
@@ -177,31 +136,7 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 		}
 	}
 
-	cdm.logger.Printf("\n✅ Total idle devices loaded: %d", totalDevices)
-	cdm.logger.Printf("✅ Spatial index cells: %d", len(cdm.deviceSpatialIndex))
-
-	// Show grid cell distribution
-	cdm.logger.Println("\n📊 Grid Cell Distribution (top 10):")
-	type cellInfo struct {
-		key   int64
-		count int
-	}
-	cells := make([]cellInfo, 0, len(cdm.deviceSpatialIndex))
-	for k, v := range cdm.deviceSpatialIndex {
-		cells = append(cells, cellInfo{k, len(v)})
-	}
-	// Sort by count
-	for i := 0; i < len(cells)-1; i++ {
-		for j := i + 1; j < len(cells); j++ {
-			if cells[j].count > cells[i].count {
-				cells[i], cells[j] = cells[j], cells[i]
-			}
-		}
-	}
-	for i := 0; i < 10 && i < len(cells); i++ {
-		cdm.logger.Printf("  Cell %d: %d devices", cells[i].key, cells[i].count)
-	}
-
+	cdm.logger.Printf("✅ Loaded %d idle devices in %d grid cells\n", totalDevices, len(cdm.deviceSpatialIndex))
 	return nil
 }
 
@@ -214,39 +149,14 @@ func (cdm *ConsumerDeviceMatcher) parsePoint(geometryStr string) (float64, float
 	return lat, lon
 }
 
-func (cdm *ConsumerDeviceMatcher) findNearbyDevices(consumerLat, consumerLon float64) []IdleDevice {
-	consumerPoint := orb.Point{consumerLon, consumerLat}
-	cells := getNearbyCells(consumerLat, consumerLon, MatchRadiusMeters)
-
-	nearbyDevices := make([]IdleDevice, 0)
-
-	cdm.indexMutex.RLock()
-	defer cdm.indexMutex.RUnlock()
-
-	for _, cellKey := range cells {
-		if devices, exists := cdm.deviceSpatialIndex[cellKey]; exists {
-			for _, device := range devices {
-				devicePoint := orb.Point{device.Longitude, device.Latitude}
-				distance := geo.Distance(consumerPoint, devicePoint)
-
-				if distance <= MatchRadiusMeters {
-					nearbyDevices = append(nearbyDevices, device)
-				}
-			}
-		}
-	}
-
-	return nearbyDevices
-}
-
-func (cdm *ConsumerDeviceMatcher) processConsumerFiles() error {
+func (cdm *ConsumerDeviceMatcher) analyzeConsumerCoordinates() error {
 	cdm.logger.Println("\n╔═══════════════════════════════════════════════════════╗")
-	cdm.logger.Println("║  PROCESSING CONSUMER FILES - DEBUG MODE               ║")
+	cdm.logger.Println("║  ANALYZING CONSUMER COORDINATES                       ║")
 	cdm.logger.Println("╚═══════════════════════════════════════════════════════╝")
 
 	patterns := []string{
-		filepath.Join(cdm.consumerFolder, "consumers_chunk_*.parquet"),
 		filepath.Join(cdm.consumerFolder, "consumer_raw_batch_*.parquet"),
+		filepath.Join(cdm.consumerFolder, "consumers_chunk_*.parquet"),
 		filepath.Join(cdm.consumerFolder, "*.parquet"),
 	}
 
@@ -269,152 +179,49 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFiles() error {
 		return fmt.Errorf("no consumer parquet files found in %s", cdm.consumerFolder)
 	}
 
-	cdm.logger.Printf("\nFound %d consumer parquet files", len(files))
-	cdm.logger.Println("Processing FIRST FILE ONLY for debugging...")
+	cdm.logger.Printf("\nFound %d consumer parquet files\n", len(files))
+	cdm.logger.Println("Analyzing ALL files for coordinate distribution...\n")
 
-	// Process only first file for debugging
-	if len(files) > 0 {
-		fpath := files[0]
-		matches, err := cdm.processConsumerFileDebug(fpath)
-		if err != nil {
-			return err
+	// Process all files to get complete statistics
+	for idx, fpath := range files {
+		if idx%10 == 0 {
+			cdm.logger.Printf("Progress: %d/%d files analyzed...", idx, len(files))
 		}
 
-		cdm.logger.Printf("\n✅ File processed: %d matches found", len(matches))
-		cdm.matches = append(cdm.matches, matches...)
+		if err := cdm.analyzeFile(fpath); err != nil {
+			cdm.logger.Printf("Warning: error analyzing %s: %v", filepath.Base(fpath), err)
+		}
 	}
+
+	// Print detailed statistics
+	cdm.printStatistics()
 
 	return nil
 }
 
-func (cdm *ConsumerDeviceMatcher) processConsumerFileDebug(fpath string) ([]ConsumerDeviceMatch, error) {
-	cdm.logger.Printf("📂 Processing: %s\n", filepath.Base(fpath))
-
-	consumers, err := cdm.readConsumersFromParquetArrow(fpath)
-	if err != nil {
-		return nil, err
-	}
-
-	cdm.logger.Printf("✅ Loaded %d consumers from file\n", len(consumers))
-
-	if len(consumers) == 0 {
-		cdm.logger.Println("⚠️  No consumers found in file!")
-		return nil, nil
-	}
-
-	// Show first 5 consumers
-	cdm.logger.Println("📋 Sample Consumers:")
-	for i := 0; i < 5 && i < len(consumers); i++ {
-		c := consumers[i]
-		cdm.logger.Printf("  Consumer #%d:", i+1)
-		cdm.logger.Printf("    ID:       %d", c.ID)
-		cdm.logger.Printf("    Name:     %s %s", c.PersonFirstName, c.PersonLastName)
-		cdm.logger.Printf("    Address:  %s", c.PrimaryAddress)
-		cdm.logger.Printf("    Lat/Lon:  %.6f, %.6f", c.Latitude, c.Longitude)
-		cdm.logger.Printf("    Grid Cell: %d", getCellKey(c.Latitude, c.Longitude))
-
-		// Check for nearby devices
-		nearby := cdm.findNearbyDevices(c.Latitude, c.Longitude)
-		cdm.logger.Printf("    Nearby devices: %d", len(nearby))
-		if len(nearby) > 0 {
-			cdm.logger.Printf("    ✅ MATCH POSSIBLE!")
-			for j, d := range nearby {
-				if j < 2 {
-					devicePoint := orb.Point{d.Longitude, d.Latitude}
-					consumerPoint := orb.Point{c.Longitude, c.Latitude}
-					distance := geo.Distance(consumerPoint, devicePoint)
-					cdm.logger.Printf("      Device: %s (distance: %.2fm)", d.DeviceID, distance)
-				}
-			}
-		}
-	}
-
-	matches := make([]ConsumerDeviceMatch, 0)
-	matchCount := 0
-
-	cdm.logger.Println("\n🔍 Searching for matches...")
-
-	for idx, consumer := range consumers {
-		if idx%10000 == 0 && idx > 0 {
-			cdm.logger.Printf("  Processed %d consumers, %d matches so far...", idx, matchCount)
-		}
-
-		nearbyDevices := cdm.findNearbyDevices(consumer.Latitude, consumer.Longitude)
-
-		for _, device := range nearbyDevices {
-			cdm.matchesMutex.Lock()
-			alreadyMatched := cdm.matchedDevices[device.DeviceID]
-			if !alreadyMatched {
-				cdm.matchedDevices[device.DeviceID] = true
-			}
-			cdm.matchesMutex.Unlock()
-
-			if alreadyMatched {
-				continue
-			}
-
-			datePart, timePart := cdm.splitDateTime(device.VisitedTime)
-
-			match := ConsumerDeviceMatch{
-				DeviceID:    device.DeviceID,
-				DateVisited: datePart,
-				TimeVisited: timePart,
-				ConsumerID:  consumer.ID,
-				Name:        cdm.buildName(consumer.PersonFirstName, consumer.PersonLastName),
-				Address:     consumer.PrimaryAddress,
-				Email:       consumer.Email,
-				CityName:    consumer.CityName,
-				State:       consumer.State,
-				ZipCode:     consumer.ZipCode,
-				POI:         device.Address,
-				Campaign:    device.Campaign,
-			}
-
-			matches = append(matches, match)
-			matchCount++
-
-			if matchCount <= 5 {
-				cdm.logger.Printf("\n🎯 MATCH FOUND #%d:", matchCount)
-				cdm.logger.Printf("  Device: %s at %.6f, %.6f", device.DeviceID, device.Latitude, device.Longitude)
-				cdm.logger.Printf("  Consumer: %d (%s) at %.6f, %.6f", consumer.ID, match.Name, consumer.Latitude, consumer.Longitude)
-				devicePoint := orb.Point{device.Longitude, device.Latitude}
-				consumerPoint := orb.Point{consumer.Longitude, consumer.Latitude}
-				distance := geo.Distance(consumerPoint, devicePoint)
-				cdm.logger.Printf("  Distance: %.2f meters", distance)
-			}
-
-			break
-		}
-	}
-
-	return matches, nil
-}
-
-func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([]ConsumerRecord, error) {
+func (cdm *ConsumerDeviceMatcher) analyzeFile(fpath string) error {
 	f, err := os.Open(fpath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer f.Close()
 
 	reader, err := file.NewParquetReader(f)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer reader.Close()
 
 	arrowReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{BatchSize: 10000}, memory.NewGoAllocator())
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	recordReader, err := arrowReader.GetRecordReader(context.TODO(), nil, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer recordReader.Release()
-
-	consumers := make([]ConsumerRecord, 0)
 
 	for recordReader.Next() {
 		rec := recordReader.Record()
@@ -427,8 +234,11 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 		}
 
 		for i := 0; i < rows; i++ {
+			cdm.stats.TotalConsumers++
+
 			consumer := ConsumerRecord{}
 
+			// Read ID
 			if idx, ok := colIndex["id"]; ok {
 				switch col := rec.Column(idx).(type) {
 				case *array.Uint64:
@@ -440,6 +250,7 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 				}
 			}
 
+			// Read coordinates
 			if idx, ok := colIndex["latitude"]; ok {
 				switch col := rec.Column(idx).(type) {
 				case *array.Float64:
@@ -458,93 +269,148 @@ func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([
 				}
 			}
 
-			if consumer.Latitude < -90 || consumer.Latitude > 90 ||
-				consumer.Longitude < -180 || consumer.Longitude > 180 {
-				continue
-			}
+			// Categorize coordinates
+			if consumer.Latitude == 0 && consumer.Longitude == 0 {
+				cdm.stats.InvalidZeroZero++
+			} else if consumer.Latitude < -90 || consumer.Latitude > 90 {
+				cdm.stats.OutOfBoundsLat++
+			} else if consumer.Longitude < -180 || consumer.Longitude > 180 {
+				cdm.stats.OutOfBoundsLon++
+			} else {
+				cdm.stats.ValidCoords++
 
-			if idx, ok := colIndex["PersonFirstName"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
-					consumer.PersonFirstName = col.Value(i)
+				// Track min/max
+				if consumer.Latitude < cdm.stats.MinLat {
+					cdm.stats.MinLat = consumer.Latitude
 				}
-			}
-			if idx, ok := colIndex["PersonLastName"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
-					consumer.PersonLastName = col.Value(i)
+				if consumer.Latitude > cdm.stats.MaxLat {
+					cdm.stats.MaxLat = consumer.Latitude
 				}
-			}
-			if idx, ok := colIndex["PrimaryAddress"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
-					consumer.PrimaryAddress = col.Value(i)
+				if consumer.Longitude < cdm.stats.MinLon {
+					cdm.stats.MinLon = consumer.Longitude
 				}
-			}
-			if idx, ok := colIndex["TenDigitPhone"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
-					consumer.TenDigitPhone = col.Value(i)
+				if consumer.Longitude > cdm.stats.MaxLon {
+					cdm.stats.MaxLon = consumer.Longitude
 				}
-			}
-			if idx, ok := colIndex["Email"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
-					consumer.Email = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["CityName"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
-					consumer.CityName = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["State"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
-					consumer.State = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["ZipCode"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
-					consumer.ZipCode = col.Value(i)
-				}
-			}
 
-			consumers = append(consumers, consumer)
+				// Save first 10 valid samples
+				if len(cdm.stats.SampleValidCoords) < 10 {
+					// Read other fields for sample
+					if idx, ok := colIndex["PersonFirstName"]; ok {
+						if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
+							consumer.PersonFirstName = col.Value(i)
+						}
+					}
+					if idx, ok := colIndex["PersonLastName"]; ok {
+						if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
+							consumer.PersonLastName = col.Value(i)
+						}
+					}
+					if idx, ok := colIndex["PrimaryAddress"]; ok {
+						if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
+							consumer.PrimaryAddress = col.Value(i)
+						}
+					}
+					if idx, ok := colIndex["CityName"]; ok {
+						if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
+							consumer.CityName = col.Value(i)
+						}
+					}
+					if idx, ok := colIndex["State"]; ok {
+						if col, ok := rec.Column(idx).(*array.String); ok && !col.IsNull(i) {
+							consumer.State = col.Value(i)
+						}
+					}
+					cdm.stats.SampleValidCoords = append(cdm.stats.SampleValidCoords, consumer)
+				}
+			}
 		}
 		rec.Release()
 	}
 
-	return consumers, nil
+	return nil
 }
 
-func (cdm *ConsumerDeviceMatcher) splitDateTime(visitedTime string) (string, string) {
-	parts := strings.Split(visitedTime, " ")
-	if len(parts) >= 2 {
-		return parts[0], parts[1]
-	}
-	return visitedTime, ""
-}
+func (cdm *ConsumerDeviceMatcher) printStatistics() {
+	cdm.logger.Println("\n╔═══════════════════════════════════════════════════════╗")
+	cdm.logger.Println("║  COORDINATE ANALYSIS RESULTS                          ║")
+	cdm.logger.Println("╚═══════════════════════════════════════════════════════╝")
 
-func (cdm *ConsumerDeviceMatcher) buildName(firstName, lastName string) string {
-	if firstName == "" && lastName == "" {
-		return ""
+	totalInvalid := cdm.stats.InvalidZeroZero + cdm.stats.OutOfBoundsLat + cdm.stats.OutOfBoundsLon
+
+	cdm.logger.Printf("\n📊 OVERALL STATISTICS:")
+	cdm.logger.Printf("   Total consumers:          %d", cdm.stats.TotalConsumers)
+	cdm.logger.Printf("   Valid coordinates:        %d (%.2f%%)",
+		cdm.stats.ValidCoords,
+		float64(cdm.stats.ValidCoords)*100/float64(cdm.stats.TotalConsumers))
+	cdm.logger.Printf("   Invalid coordinates:      %d (%.2f%%)",
+		totalInvalid,
+		float64(totalInvalid)*100/float64(cdm.stats.TotalConsumers))
+
+	cdm.logger.Printf("\n📉 BREAKDOWN OF INVALID:")
+	cdm.logger.Printf("   (0, 0) coordinates:       %d (%.2f%%)",
+		cdm.stats.InvalidZeroZero,
+		float64(cdm.stats.InvalidZeroZero)*100/float64(cdm.stats.TotalConsumers))
+	cdm.logger.Printf("   Out of bounds latitude:   %d", cdm.stats.OutOfBoundsLat)
+	cdm.logger.Printf("   Out of bounds longitude:  %d", cdm.stats.OutOfBoundsLon)
+
+	if cdm.stats.ValidCoords > 0 {
+		cdm.logger.Printf("\n📍 COORDINATE BOUNDS:")
+		cdm.logger.Printf("   Latitude range:  %.6f to %.6f", cdm.stats.MinLat, cdm.stats.MaxLat)
+		cdm.logger.Printf("   Longitude range: %.6f to %.6f", cdm.stats.MinLon, cdm.stats.MaxLon)
+
+		cdm.logger.Printf("\n✅ SAMPLE VALID CONSUMERS:")
+		for idx, c := range cdm.stats.SampleValidCoords {
+			cdm.logger.Printf("   Sample #%d:", idx+1)
+			cdm.logger.Printf("     ID:       %d", c.ID)
+			cdm.logger.Printf("     Name:     %s %s", c.PersonFirstName, c.PersonLastName)
+			cdm.logger.Printf("     Address:  %s, %s %s", c.PrimaryAddress, c.CityName, c.State)
+			cdm.logger.Printf("     Lat/Lon:  %.6f, %.6f", c.Latitude, c.Longitude)
+			cdm.logger.Printf("     Grid Cell: %d", getCellKey(c.Latitude, c.Longitude))
+		}
+
+		// Check if valid consumers are in USA (where devices are)
+		usaCount := 0
+		for _, c := range cdm.stats.SampleValidCoords {
+			if c.Latitude >= 24 && c.Latitude <= 50 && c.Longitude >= -125 && c.Longitude <= -65 {
+				usaCount++
+			}
+		}
+		cdm.logger.Printf("\n🗺️  GEOGRAPHIC CHECK:")
+		cdm.logger.Printf("   Samples in USA bounds: %d/%d", usaCount, len(cdm.stats.SampleValidCoords))
+		if usaCount == 0 {
+			cdm.logger.Println("   ⚠️  WARNING: Valid consumers may not be in USA where devices are!")
+		}
 	}
-	return strings.TrimSpace(firstName + " " + lastName)
+
+	cdm.logger.Println("\n╚═══════════════════════════════════════════════════════╝")
 }
 
 func (cdm *ConsumerDeviceMatcher) Run() error {
 	startTime := time.Now()
 
 	if err := cdm.loadIdleDevices(); err != nil {
-		return fmt.Errorf("failed to load idle devices: %w", err)
+		return err
 	}
 
-	if err := cdm.processConsumerFiles(); err != nil {
-		return fmt.Errorf("failed to process consumer files: %w", err)
+	if err := cdm.analyzeConsumerCoordinates(); err != nil {
+		return err
 	}
 
 	elapsed := time.Since(startTime)
 
-	cdm.logger.Printf("\n╔═══════════════════════════════════════════════════════╗")
-	cdm.logger.Printf("║  DEBUG SUMMARY")
-	cdm.logger.Printf("╚═══════════════════════════════════════════════════════╝")
-	cdm.logger.Printf("Total matches found: %d", len(cdm.matches))
-	cdm.logger.Printf("Time elapsed: %.2f seconds", elapsed.Seconds())
+	cdm.logger.Printf("\n⏱️  Analysis completed in %.2f seconds\n", elapsed.Seconds())
+
+	if cdm.stats.ValidCoords > 0 {
+		percentage := float64(cdm.stats.ValidCoords) * 100 / float64(cdm.stats.TotalConsumers)
+		cdm.logger.Printf("✅ GOOD NEWS: You have %d consumers (%.2f%%) with valid coordinates!",
+			cdm.stats.ValidCoords, percentage)
+		cdm.logger.Println("   Step 4 matching should work with these consumers.")
+		cdm.logger.Println("   Re-run the optimized matcher to find matches!")
+	} else {
+		cdm.logger.Println("❌ NO VALID COORDINATES: All consumers have invalid lat/lon")
+		cdm.logger.Println("   Need to geocode consumer addresses before matching")
+	}
 
 	return nil
 }
