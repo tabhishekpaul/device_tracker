@@ -1,414 +1,488 @@
 package main
 
 import (
-	"context"
-	"crypto/md5"
-	"database/sql"
+	"encoding/csv"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/apache/arrow/go/v14/arrow"
 	"github.com/apache/arrow/go/v14/arrow/array"
 	"github.com/apache/arrow/go/v14/arrow/memory"
-	"github.com/apache/arrow/go/v14/parquet/file"
+	"github.com/apache/arrow/go/v14/parquet"
+	"github.com/apache/arrow/go/v14/parquet/compress"
 	"github.com/apache/arrow/go/v14/parquet/pqarrow"
-
-	"github.com/ClickHouse/clickhouse-go/v2"
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	_ "github.com/mattn/go-sqlite3"
 )
 
-type ClickHouseConfig struct {
-	Host     string
-	Port     int
-	Database string
-	Username string
-	Password string
+const (
+	MaxOutputFiles  = 300
+	RecordsPerBatch = 50000
+	BufferedRecords = 1000000
+)
+
+type ConsumerRecord struct {
+	ID              string
+	Latitude        float64
+	Longitude       float64
+	PersonFirstName string
+	PersonLastName  string
+	PrimaryAddress  string
+	TenDigitPhone   string
+	Email           string
+	CityName        string
+	State           string
+	ZipCode         string
 }
 
-type ProcessedFile struct {
-	FilePath    string
-	FileHash    string
-	ProcessedAt time.Time
-	RecordCount int
+type ParquetWriter struct {
+	mutex      sync.Mutex
+	batch      []ConsumerRecord
+	writer     *pqarrow.FileWriter
+	file       *os.File
+	schema     *arrow.Schema
+	chunkID    int
+	totalCount int64
 }
 
-type ConsumerParquetLoader struct {
-	chConn  driver.Conn
-	localDB *sql.DB
-	logger  *log.Logger
-	dbPath  string
+type StreamConverter struct {
+	csvPath      string
+	outputFolder string
+	logger       *log.Logger
+	writers      []*ParquetWriter
+	totalRecords atomic.Int64
+	skippedRows  atomic.Int64
+	startTime    time.Time
 }
 
-func NewConsumerParquetLoader(chConfig ClickHouseConfig, localDBPath string) (*ConsumerParquetLoader, error) {
-	logger := log.New(os.Stdout, "[ConsumerParquetLoader] ", log.LstdFlags|log.Lmicroseconds)
+func NewStreamConverter(csvPath, outputFolder string) (*StreamConverter, error) {
+	logger := log.New(os.Stdout, "", 0)
 
-	// Initialize ClickHouse connection
-	chConn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{fmt.Sprintf("%s:%d", chConfig.Host, chConfig.Port)},
-		Auth: clickhouse.Auth{
-			Database: chConfig.Database,
-			Username: chConfig.Username,
-			Password: chConfig.Password,
+	return &StreamConverter{
+		csvPath:      csvPath,
+		outputFolder: outputFolder,
+		logger:       logger,
+	}, nil
+}
+
+func (sc *StreamConverter) initWriters() error {
+	if err := os.MkdirAll(sc.outputFolder, 0755); err != nil {
+		return err
+	}
+
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "id", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "latitude", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+			{Name: "longitude", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+			{Name: "PersonFirstName", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "PersonLastName", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "PrimaryAddress", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "TenDigitPhone", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "Email", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "CityName", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "State", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "ZipCode", Type: arrow.BinaryTypes.String, Nullable: false},
 		},
-		DialTimeout: 30 * time.Second,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to ClickHouse: %w", err)
+		nil,
+	)
+
+	sc.writers = make([]*ParquetWriter, MaxOutputFiles)
+
+	sc.logger.Printf("Initializing %d parquet writers...", MaxOutputFiles)
+
+	for i := 0; i < MaxOutputFiles; i++ {
+		chunkPath := filepath.Join(sc.outputFolder, fmt.Sprintf("consumers_chunk_%03d.parquet", i))
+
+		file, err := os.Create(chunkPath)
+		if err != nil {
+			return fmt.Errorf("failed to create chunk %d: %w", i, err)
+		}
+
+		props := parquet.NewWriterProperties(
+			parquet.WithCompression(compress.Codecs.Snappy),
+			parquet.WithDictionaryDefault(true),
+		)
+
+		writer, err := pqarrow.NewFileWriter(schema, file, props, pqarrow.DefaultWriterProps())
+		if err != nil {
+			file.Close()
+			return fmt.Errorf("failed to create writer %d: %w", i, err)
+		}
+
+		sc.writers[i] = &ParquetWriter{
+			batch:   make([]ConsumerRecord, 0, RecordsPerBatch),
+			writer:  writer,
+			file:    file,
+			schema:  schema,
+			chunkID: i,
+		}
 	}
 
-	if err := chConn.Ping(context.Background()); err != nil {
-		return nil, fmt.Errorf("failed to ping ClickHouse: %w", err)
-	}
-
-	// Initialize local SQLite database
-	localDB, err := sql.Open("sqlite3", localDBPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open local database: %w", err)
-	}
-
-	loader := &ConsumerParquetLoader{
-		chConn:  chConn,
-		localDB: localDB,
-		logger:  logger,
-		dbPath:  localDBPath,
-	}
-
-	if err := loader.initLocalDB(); err != nil {
-		return nil, fmt.Errorf("failed to initialize local database: %w", err)
-	}
-
-	return loader, nil
-}
-
-func (cpl *ConsumerParquetLoader) initLocalDB() error {
-	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS processed_files (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		file_path TEXT NOT NULL UNIQUE,
-		file_hash TEXT NOT NULL,
-		processed_at DATETIME NOT NULL,
-		record_count INTEGER NOT NULL,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-	
-	CREATE INDEX IF NOT EXISTS idx_file_path ON processed_files(file_path);
-	CREATE INDEX IF NOT EXISTS idx_file_hash ON processed_files(file_hash);
-	`
-
-	if _, err := cpl.localDB.Exec(createTableSQL); err != nil {
-		return fmt.Errorf("failed to create tables: %w", err)
-	}
-
-	cpl.logger.Printf("Local tracking database initialized at: %s", cpl.dbPath)
+	sc.logger.Println("✅ Writers initialized")
 	return nil
 }
 
-func (cpl *ConsumerParquetLoader) calculateFileHash(filePath string) (string, error) {
-	file, err := os.Open(filePath)
+func (sc *StreamConverter) hashString(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
+}
+
+func (sc *StreamConverter) addRecord(record ConsumerRecord) error {
+	// Distribute by hash of ID
+	chunkIdx := int(sc.hashString(record.ID)) % MaxOutputFiles
+	writer := sc.writers[chunkIdx]
+
+	writer.mutex.Lock()
+	defer writer.mutex.Unlock()
+
+	writer.batch = append(writer.batch, record)
+	writer.totalCount++
+
+	if len(writer.batch) >= RecordsPerBatch {
+		return sc.flushWriter(writer)
+	}
+
+	return nil
+}
+
+func (sc *StreamConverter) flushWriter(w *ParquetWriter) error {
+	if len(w.batch) == 0 {
+		return nil
+	}
+
+	pool := memory.NewGoAllocator()
+
+	idBuilder := array.NewStringBuilder(pool)
+	latBuilder := array.NewFloat64Builder(pool)
+	lonBuilder := array.NewFloat64Builder(pool)
+	firstNameBuilder := array.NewStringBuilder(pool)
+	lastNameBuilder := array.NewStringBuilder(pool)
+	addressBuilder := array.NewStringBuilder(pool)
+	phoneBuilder := array.NewStringBuilder(pool)
+	emailBuilder := array.NewStringBuilder(pool)
+	cityBuilder := array.NewStringBuilder(pool)
+	stateBuilder := array.NewStringBuilder(pool)
+	zipBuilder := array.NewStringBuilder(pool)
+
+	for i := range w.batch {
+		rec := &w.batch[i]
+		idBuilder.Append(rec.ID)
+		latBuilder.Append(rec.Latitude)
+		lonBuilder.Append(rec.Longitude)
+		firstNameBuilder.Append(rec.PersonFirstName)
+		lastNameBuilder.Append(rec.PersonLastName)
+		addressBuilder.Append(rec.PrimaryAddress)
+		phoneBuilder.Append(rec.TenDigitPhone)
+		emailBuilder.Append(rec.Email)
+		cityBuilder.Append(rec.CityName)
+		stateBuilder.Append(rec.State)
+		zipBuilder.Append(rec.ZipCode)
+	}
+
+	idArray := idBuilder.NewArray()
+	latArray := latBuilder.NewArray()
+	lonArray := lonBuilder.NewArray()
+	firstNameArray := firstNameBuilder.NewArray()
+	lastNameArray := lastNameBuilder.NewArray()
+	addressArray := addressBuilder.NewArray()
+	phoneArray := phoneBuilder.NewArray()
+	emailArray := emailBuilder.NewArray()
+	cityArray := cityBuilder.NewArray()
+	stateArray := stateBuilder.NewArray()
+	zipArray := zipBuilder.NewArray()
+
+	defer idArray.Release()
+	defer latArray.Release()
+	defer lonArray.Release()
+	defer firstNameArray.Release()
+	defer lastNameArray.Release()
+	defer addressArray.Release()
+	defer phoneArray.Release()
+	defer emailArray.Release()
+	defer cityArray.Release()
+	defer stateArray.Release()
+	defer zipArray.Release()
+
+	record := array.NewRecord(
+		w.schema,
+		[]arrow.Array{idArray, latArray, lonArray, firstNameArray, lastNameArray,
+			addressArray, phoneArray, emailArray, cityArray, stateArray, zipArray},
+		int64(len(w.batch)),
+	)
+	defer record.Release()
+
+	if err := w.writer.Write(record); err != nil {
+		return fmt.Errorf("chunk %d write error: %w", w.chunkID, err)
+	}
+
+	w.batch = w.batch[:0]
+	return nil
+}
+
+func (sc *StreamConverter) closeAllWriters() error {
+	sc.logger.Println("\nFlushing remaining batches...")
+
+	nonEmptyChunks := 0
+	for _, w := range sc.writers {
+		if w != nil {
+			w.mutex.Lock()
+			if err := sc.flushWriter(w); err != nil {
+				sc.logger.Printf("Error flushing chunk %d: %v", w.chunkID, err)
+			}
+			if w.totalCount > 0 {
+				nonEmptyChunks++
+			}
+			w.writer.Close()
+			w.file.Close()
+			w.mutex.Unlock()
+		}
+	}
+
+	sc.logger.Printf("✅ Closed %d writers (%d non-empty)", MaxOutputFiles, nonEmptyChunks)
+	return nil
+}
+
+func (sc *StreamConverter) Convert() error {
+	sc.logger.Println("╔═══════════════════════════════════════════════════════╗")
+	sc.logger.Println("║  CSV TO PARQUET - STREAMING CONVERTER                ║")
+	sc.logger.Println("╚═══════════════════════════════════════════════════════╝")
+	sc.logger.Printf("Input:  %s", sc.csvPath)
+	sc.logger.Printf("Output: %s", sc.outputFolder)
+	sc.logger.Printf("Chunks: %d\n", MaxOutputFiles)
+
+	file, err := os.Open(sc.csvPath)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("failed to open CSV: %w", err)
 	}
 	defer file.Close()
 
-	hash := md5.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
+	reader := csv.NewReader(file)
+	reader.ReuseRecord = true
 
-	return fmt.Sprintf("%x", hash.Sum(nil)), nil
-}
-
-func (cpl *ConsumerParquetLoader) isFileProcessed(filePath string) (bool, string, error) {
-	// Calculate current file hash
-	currentHash, err := cpl.calculateFileHash(filePath)
+	// Read header
+	header, err := reader.Read()
 	if err != nil {
-		return false, "", fmt.Errorf("failed to calculate file hash: %w", err)
+		return fmt.Errorf("failed to read header: %w", err)
 	}
 
-	// Check if file with same path and hash exists
-	var existingHash string
-	var processedAt string
-	query := "SELECT file_hash, processed_at FROM processed_files WHERE file_path = ?"
-
-	err = cpl.localDB.QueryRow(query, filePath).Scan(&existingHash, &processedAt)
-	if err == sql.ErrNoRows {
-		return false, currentHash, nil // File not processed
-	}
-	if err != nil {
-		return false, "", fmt.Errorf("failed to check processed files: %w", err)
+	// Build column index
+	colIndex := make(map[string]int)
+	for i, col := range header {
+		colIndex[col] = i
 	}
 
-	// If hashes match, file was already processed
-	if existingHash == currentHash {
-		cpl.logger.Printf("File %s already processed at %s (hash: %s)",
-			filepath.Base(filePath), processedAt, currentHash[:8])
-		return true, currentHash, nil
+	sc.logger.Printf("CSV Columns: %d", len(header))
+
+	// Verify required columns exist
+	requiredCols := []string{"IndividualID", "Latitude", "Longitude"}
+	for _, col := range requiredCols {
+		if _, ok := colIndex[col]; !ok {
+			return fmt.Errorf("missing required column: %s", col)
+		}
 	}
 
-	// File exists but hash is different (file was modified)
-	cpl.logger.Printf("File %s was modified since last processing, will reprocess", filepath.Base(filePath))
-	return false, currentHash, nil
-}
-
-func (cpl *ConsumerParquetLoader) markFileAsProcessed(filePath, fileHash string, recordCount int) error {
-	// Use REPLACE to handle both insert and update cases
-	query := `
-	REPLACE INTO processed_files (file_path, file_hash, processed_at, record_count)
-	VALUES (?, ?, ?, ?)
-	`
-
-	_, err := cpl.localDB.Exec(query, filePath, fileHash, time.Now(), recordCount)
-	if err != nil {
-		return fmt.Errorf("failed to mark file as processed: %w", err)
+	// Initialize writers
+	if err := sc.initWriters(); err != nil {
+		return err
 	}
+
+	sc.logger.Println("\n📦 Processing records (streaming mode)...")
+	sc.startTime = time.Now()
+
+	lineNum := 1
+	lastUpdate := time.Now()
+
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			sc.skippedRows.Add(1)
+			lineNum++
+			continue
+		}
+
+		lineNum++
+
+		record, err := sc.parseRecord(row, colIndex)
+		if err != nil {
+			sc.skippedRows.Add(1)
+			continue
+		}
+
+		if err := sc.addRecord(record); err != nil {
+			sc.logger.Printf("Error adding record: %v", err)
+			continue
+		}
+
+		sc.totalRecords.Add(1)
+
+		// Progress update every 5 seconds
+		if time.Since(lastUpdate) >= 5*time.Second {
+			elapsed := time.Since(sc.startTime)
+			rate := float64(sc.totalRecords.Load()) / elapsed.Seconds()
+			sc.logger.Printf("  ⚡ %d records (%.0f rec/sec, %.0f min elapsed)",
+				sc.totalRecords.Load(), rate, elapsed.Minutes())
+			lastUpdate = time.Now()
+			runtime.GC()
+		}
+	}
+
+	if err := sc.closeAllWriters(); err != nil {
+		return err
+	}
+
+	elapsed := time.Since(sc.startTime)
+	avgRate := float64(sc.totalRecords.Load()) / elapsed.Seconds()
+
+	sc.logger.Println("\n╔═══════════════════════════════════════════════════════╗")
+	sc.logger.Println("║  ✅ CONVERSION COMPLETE                               ║")
+	sc.logger.Println("╚═══════════════════════════════════════════════════════╝")
+	sc.logger.Printf("Total records:   %d", sc.totalRecords.Load())
+	sc.logger.Printf("Skipped rows:    %d", sc.skippedRows.Load())
+	sc.logger.Printf("Time elapsed:    %v", elapsed)
+	sc.logger.Printf("Average rate:    %.0f records/sec", avgRate)
+	sc.logger.Printf("Output location: %s\n", sc.outputFolder)
+
+	// Show file stats
+	sc.printFileStats()
 
 	return nil
 }
 
-func (cpl *ConsumerParquetLoader) getProcessedFilesStats() (int, int, error) {
-	var totalFiles, totalRecords int
+func (sc *StreamConverter) parseRecord(row []string, colIndex map[string]int) (ConsumerRecord, error) {
+	var record ConsumerRecord
 
-	query := "SELECT COUNT(*), COALESCE(SUM(record_count), 0) FROM processed_files"
-	err := cpl.localDB.QueryRow(query).Scan(&totalFiles, &totalRecords)
+	// Get ID
+	if idx, ok := colIndex["IndividualID"]; ok && idx < len(row) {
+		record.ID = row[idx]
+		if record.ID == "" {
+			return record, fmt.Errorf("empty ID")
+		}
+	} else {
+		return record, fmt.Errorf("missing ID")
+	}
 
-	return totalFiles, totalRecords, err
+	// Parse latitude
+	if idx, ok := colIndex["Latitude"]; ok && idx < len(row) {
+		lat, err := strconv.ParseFloat(row[idx], 64)
+		if err != nil || lat < -90 || lat > 90 {
+			return record, fmt.Errorf("invalid latitude")
+		}
+		record.Latitude = lat
+	} else {
+		return record, fmt.Errorf("missing latitude")
+	}
+
+	// Parse longitude
+	if idx, ok := colIndex["Longitude"]; ok && idx < len(row) {
+		lon, err := strconv.ParseFloat(row[idx], 64)
+		if err != nil || lon < -180 || lon > 180 {
+			return record, fmt.Errorf("invalid longitude")
+		}
+		record.Longitude = lon
+	} else {
+		return record, fmt.Errorf("missing longitude")
+	}
+
+	// Parse optional string fields
+	if idx, ok := colIndex["PersonFirstName"]; ok && idx < len(row) {
+		record.PersonFirstName = row[idx]
+	}
+	if idx, ok := colIndex["PersonLastName"]; ok && idx < len(row) {
+		record.PersonLastName = row[idx]
+	}
+	if idx, ok := colIndex["PrimaryAddress"]; ok && idx < len(row) {
+		record.PrimaryAddress = row[idx]
+	}
+	if idx, ok := colIndex["TenDigitPhone"]; ok && idx < len(row) {
+		record.TenDigitPhone = row[idx]
+	}
+	if idx, ok := colIndex["Email"]; ok && idx < len(row) {
+		record.Email = row[idx]
+	}
+	if idx, ok := colIndex["CityName"]; ok && idx < len(row) {
+		record.CityName = row[idx]
+	}
+	if idx, ok := colIndex["State"]; ok && idx < len(row) {
+		record.State = row[idx]
+	}
+	if idx, ok := colIndex["ZipCode"]; ok && idx < len(row) {
+		record.ZipCode = row[idx]
+	}
+
+	return record, nil
 }
 
-func (cpl *ConsumerParquetLoader) LoadConsumersFromParquet(ctx context.Context, parquetFolder string) error {
-	cpl.logger.Printf("Loading consumers from parquet files in %s", parquetFolder)
+func (sc *StreamConverter) printFileStats() {
+	sc.logger.Println("📁 Output files:")
 
-	files, err := filepath.Glob(filepath.Join(parquetFolder, "*.parquet"))
-	if err != nil {
-		return fmt.Errorf("failed to list parquet files: %w", err)
-	}
-	if len(files) == 0 {
-		return fmt.Errorf("no parquet files found in %s", parquetFolder)
-	}
+	nonEmpty := 0
+	var totalSize int64
 
-	// Get initial stats
-	processedFiles, processedRecords, _ := cpl.getProcessedFilesStats()
-	cpl.logger.Printf("Found %d parquet files. Previously processed: %d files, %d records",
-		len(files), processedFiles, processedRecords)
-
-	totalRecords := 0
-	skippedFiles := 0
-	processedFilesCount := 0
-	batchSize := 100000
-
-	for idx, filePath := range files {
-		cpl.logger.Printf("Checking file %d/%d: %s", idx+1, len(files), filepath.Base(filePath))
-
-		// Check if file was already processed
-		isProcessed, fileHash, err := cpl.isFileProcessed(filePath)
-		if err != nil {
-			cpl.logger.Printf("Error checking file status: %v", err)
-			continue
+	for _, w := range sc.writers {
+		if w.totalCount > 0 {
+			nonEmpty++
+			if nonEmpty <= 5 {
+				path := filepath.Join(sc.outputFolder, fmt.Sprintf("consumers_chunk_%03d.parquet", w.chunkID))
+				info, err := os.Stat(path)
+				if err == nil {
+					sc.logger.Printf("   Chunk %03d: %7d records (%s)",
+						w.chunkID, w.totalCount, formatSize(info.Size()))
+					totalSize += info.Size()
+				}
+			}
 		}
-
-		if isProcessed {
-			skippedFiles++
-			continue
-		}
-
-		// Process the file
-		fileRecords, err := cpl.processParquetFile(ctx, filePath, batchSize)
-		if err != nil {
-			cpl.logger.Printf("Error processing file %s: %v", filepath.Base(filePath), err)
-			continue
-		}
-
-		// Mark file as processed
-		if err := cpl.markFileAsProcessed(filePath, fileHash, fileRecords); err != nil {
-			cpl.logger.Printf("Warning: failed to mark file as processed: %v", err)
-		}
-
-		totalRecords += fileRecords
-		processedFilesCount++
-
-		cpl.logger.Printf("✅ Processed file %s: %d records", filepath.Base(filePath), fileRecords)
 	}
 
-	cpl.logger.Printf("🎉 Processing complete!")
-	cpl.logger.Printf("   - Files processed: %d", processedFilesCount)
-	cpl.logger.Printf("   - Files skipped: %d", skippedFiles)
-	cpl.logger.Printf("   - New records loaded: %d", totalRecords)
+	if nonEmpty > 5 {
+		sc.logger.Printf("   ... and %d more chunks\n", nonEmpty-5)
+	}
 
-	// Final stats
-	finalFiles, finalRecords, _ := cpl.getProcessedFilesStats()
-	cpl.logger.Printf("   - Total files in tracking DB: %d", finalFiles)
-	cpl.logger.Printf("   - Total records in tracking DB: %d", finalRecords)
-
-	return nil
+	sc.logger.Printf("Total chunks: %d (non-empty)", nonEmpty)
+	sc.logger.Printf("Total size:   %s\n", formatSize(totalSize))
 }
 
-func (cpl *ConsumerParquetLoader) processParquetFile(ctx context.Context, filePath string, batchSize int) (int, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return 0, fmt.Errorf("error opening file: %w", err)
+func formatSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
 	}
-	defer f.Close()
-
-	reader, err := file.NewParquetReader(f)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create parquet reader: %w", err)
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
 	}
-	defer reader.Close()
-
-	arrowReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{BatchSize: 1024}, memory.NewGoAllocator())
-	if err != nil {
-		return 0, fmt.Errorf("failed to create arrow reader: %w", err)
-	}
-
-	recordReader, err := arrowReader.GetRecordReader(ctx, nil, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get record reader: %w", err)
-	}
-	defer recordReader.Release()
-
-	batch, err := cpl.chConn.PrepareBatch(ctx, `INSERT INTO consumers 
-		(id, latitude, longitude, PersonFirstName, PersonLastName, PrimaryAddress, TenDigitPhone, Email, CityName, State, ZipCode)`)
-	if err != nil {
-		return 0, fmt.Errorf("failed to prepare batch: %w", err)
-	}
-
-	fileRecords := 0
-
-	for recordReader.Next() {
-		rec := recordReader.Record()
-		rows := int(rec.NumRows())
-		fields := rec.Schema().Fields()
-
-		colIndex := make(map[string]int)
-		for i, f := range fields {
-			colIndex[f.Name] = i
-		}
-
-		for i := 0; i < rows; i++ {
-			id := uint64(0)
-			lat := float64(0)
-			long := float64(0)
-			firstName, lastName, address, phone, email, city, state, zip := "", "", "", "", "", "", "", ""
-
-			if idx, ok := colIndex["id"]; ok {
-				if col, ok := rec.Column(idx).(*array.Int64); ok {
-					id = uint64(col.Value(i))
-				}
-			}
-
-			if idx, ok := colIndex["latitude"]; ok {
-				switch col := rec.Column(idx).(type) {
-				case *array.Float64:
-					lat = col.Value(i)
-				case *array.String:
-					val := col.Value(i)
-					if f, err := strconv.ParseFloat(val, 64); err == nil {
-						lat = f
-					}
-				}
-			}
-
-			if idx, ok := colIndex["longitude"]; ok {
-				switch col := rec.Column(idx).(type) {
-				case *array.Float64:
-					long = col.Value(i)
-				case *array.String:
-					val := col.Value(i)
-					if f, err := strconv.ParseFloat(val, 64); err == nil {
-						long = f
-					}
-				}
-			}
-
-			if lat < -90 || lat > 90 || long < -180 || long > 180 {
-				continue
-			}
-
-			if idx, ok := colIndex["PersonFirstName"]; ok {
-				firstName = rec.Column(idx).(*array.String).Value(i)
-			}
-			if idx, ok := colIndex["PersonLastName"]; ok {
-				lastName = rec.Column(idx).(*array.String).Value(i)
-			}
-			if idx, ok := colIndex["PrimaryAddress"]; ok {
-				address = rec.Column(idx).(*array.String).Value(i)
-			}
-			if idx, ok := colIndex["TenDigitPhone"]; ok {
-				phone = rec.Column(idx).(*array.String).Value(i)
-			}
-			if idx, ok := colIndex["Email"]; ok {
-				email = rec.Column(idx).(*array.String).Value(i)
-			}
-			if idx, ok := colIndex["CityName"]; ok {
-				city = rec.Column(idx).(*array.String).Value(i)
-			}
-			if idx, ok := colIndex["State"]; ok {
-				state = rec.Column(idx).(*array.String).Value(i)
-			}
-			if idx, ok := colIndex["ZipCode"]; ok {
-				zip = rec.Column(idx).(*array.String).Value(i)
-			}
-
-			if err := batch.Append(id, lat, long, firstName, lastName, address, phone, email, city, state, zip); err != nil {
-				cpl.logger.Printf("Error appending: %v", err)
-				continue
-			}
-
-			fileRecords++
-			if fileRecords%batchSize == 0 {
-				if err := batch.Send(); err != nil {
-					return 0, fmt.Errorf("batch send error: %w", err)
-				}
-				batch, _ = cpl.chConn.PrepareBatch(ctx, `INSERT INTO consumers 
-					(id, latitude, longitude, PersonFirstName, PersonLastName, PrimaryAddress, TenDigitPhone, Email, CityName, State, ZipCode)`)
-			}
-		}
-		rec.Release()
-	}
-
-	if err := batch.Send(); err != nil {
-		return 0, fmt.Errorf("failed to send final batch: %w", err)
-	}
-
-	runtime.GC()
-	return fileRecords, nil
-}
-
-func (cpl *ConsumerParquetLoader) Close() {
-	if cpl.chConn != nil {
-		cpl.chConn.Close()
-	}
-	if cpl.localDB != nil {
-		cpl.localDB.Close()
-	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 func main() {
-	chConfig := ClickHouseConfig{
-		Host:     "172.173.97.164",
-		Port:     9000,
-		Database: "device_tracking",
-		Username: "default",
-		Password: "nyros",
+	csvPath := "ConsumerData.csv"
+	outputFolder := "/home/device-tracker/data/output/consumers"
+
+	if len(os.Args) > 1 {
+		csvPath = os.Args[1]
+	}
+	if len(os.Args) > 2 {
+		outputFolder = os.Args[2]
 	}
 
-	// Local SQLite database path
-	localDBPath := "./parquet_tracking.db"
-
-	loader, err := NewConsumerParquetLoader(chConfig, localDBPath)
+	converter, err := NewStreamConverter(csvPath, outputFolder)
 	if err != nil {
-		log.Fatalf("Failed to create loader: %v", err)
+		log.Fatalf("Failed to create converter: %v", err)
 	}
-	defer loader.Close()
 
-	ctx := context.Background()
-	parquetPath := "/home/device-tracker/data/output/consumer_raw/"
-	if err := loader.LoadConsumersFromParquet(ctx, parquetPath); err != nil {
-		log.Fatalf("Failed to load data: %v", err)
+	if err := converter.Convert(); err != nil {
+		log.Fatalf("Conversion failed: %v", err)
 	}
 }
