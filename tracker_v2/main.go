@@ -1673,7 +1673,7 @@ func main() {
 
 	startTime := time.Now()
 
-	runSteps := []int{1, 2} // Change to []int{3} for idle detection
+	runSteps := []int{3} // Change to []int{3} for idle detection
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
