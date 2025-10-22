@@ -467,7 +467,7 @@ func formatSize(bytes int64) string {
 }
 
 func main() {
-	csvPath := "ConsumerData.csv"
+	csvPath := "/root/device_tracker/data/ConsumerData.csv"
 	outputFolder := "/home/device-tracker/data/output/consumers"
 
 	if len(os.Args) > 1 {
