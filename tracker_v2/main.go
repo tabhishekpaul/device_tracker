@@ -1473,44 +1473,6 @@ func (dt *DeviceTracker) readRowGroup(pf *file.Reader, rgIdx int) ([]DeviceRecor
 	return records, nil
 }
 
-func (dt *DeviceTracker) readTimestampColumn(rg *file.RowGroupReader, colIdx int, numRows int) []time.Time {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("Panic reading timestamp: %v\n", r)
-		}
-	}()
-
-	col, err := rg.Column(colIdx)
-	if err != nil {
-		return make([]time.Time, 0)
-	}
-
-	result := make([]time.Time, 0, numRows)
-
-	switch reader := col.(type) {
-	case *file.Int64ColumnChunkReader:
-		values := make([]int64, 8192)
-		defLevels := make([]int16, 8192)
-
-		for {
-			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
-			if n == 0 {
-				break
-			}
-			for i := 0; i < int(n); i++ {
-				if defLevels[i] > 0 {
-					t := time.Unix(0, values[i]*1000).UTC()
-					result = append(result, t)
-				} else {
-					result = append(result, time.Time{})
-				}
-			}
-		}
-	}
-
-	return result
-}
-
 func (dt *DeviceTracker) readStringColumn(rg *file.RowGroupReader, colIdx int, numRows int) []string {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1530,16 +1492,63 @@ func (dt *DeviceTracker) readStringColumn(rg *file.RowGroupReader, colIdx int, n
 		values := make([]parquet.ByteArray, 8192)
 		defLevels := make([]int16, 8192)
 
+		// CRITICAL FIX: Check if column is nullable
+		maxDefLevel := reader.Descriptor().MaxDefinitionLevel()
+
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
+			if n == 0 {
+				break
+			}
+
+			// For non-nullable (maxDefLevel=0): defLevel=0 means present
+			// For nullable (maxDefLevel>0): defLevel>0 means present
+			for i := 0; i < int(n); i++ {
+				if maxDefLevel == 0 || defLevels[i] > 0 {
+					result = append(result, string(values[i]))
+				} else {
+					result = append(result, "")
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+func (dt *DeviceTracker) readTimestampColumn(rg *file.RowGroupReader, colIdx int, numRows int) []time.Time {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Panic reading timestamp: %v\n", r)
+		}
+	}()
+
+	col, err := rg.Column(colIdx)
+	if err != nil {
+		return make([]time.Time, 0)
+	}
+
+	result := make([]time.Time, 0, numRows)
+
+	switch reader := col.(type) {
+	case *file.Int64ColumnChunkReader:
+		values := make([]int64, 8192)
+		defLevels := make([]int16, 8192)
+
+		// CRITICAL FIX: Check if column is nullable
+		maxDefLevel := reader.Descriptor().MaxDefinitionLevel()
+
 		for {
 			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
 			if n == 0 {
 				break
 			}
 			for i := 0; i < int(n); i++ {
-				if defLevels[i] > 0 {
-					result = append(result, string(values[i]))
+				if maxDefLevel == 0 || defLevels[i] > 0 {
+					t := time.Unix(0, values[i]*1000).UTC()
+					result = append(result, t)
 				} else {
-					result = append(result, "")
+					result = append(result, time.Time{})
 				}
 			}
 		}
@@ -1567,13 +1576,16 @@ func (dt *DeviceTracker) readFloatColumn(rg *file.RowGroupReader, colIdx int, nu
 		values := make([]float64, 8192)
 		defLevels := make([]int16, 8192)
 
+		// CRITICAL FIX: Check if column is nullable
+		maxDefLevel := reader.Descriptor().MaxDefinitionLevel()
+
 		for {
 			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
 			if n == 0 {
 				break
 			}
 			for i := 0; i < int(n); i++ {
-				if defLevels[i] > 0 {
+				if maxDefLevel == 0 || defLevels[i] > 0 {
 					result = append(result, values[i])
 				} else {
 					result = append(result, 0.0)
@@ -1584,13 +1596,16 @@ func (dt *DeviceTracker) readFloatColumn(rg *file.RowGroupReader, colIdx int, nu
 		values := make([]float32, 8192)
 		defLevels := make([]int16, 8192)
 
+		// CRITICAL FIX: Check if column is nullable
+		maxDefLevel := reader.Descriptor().MaxDefinitionLevel()
+
 		for {
 			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
 			if n == 0 {
 				break
 			}
 			for i := 0; i < int(n); i++ {
-				if defLevels[i] > 0 {
+				if maxDefLevel == 0 || defLevels[i] > 0 {
 					result = append(result, float64(values[i]))
 				} else {
 					result = append(result, 0.0)
