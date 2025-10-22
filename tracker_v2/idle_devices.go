@@ -206,7 +206,7 @@ func (dt *DeviceTracker) GetUniqIdDataFrame() (map[string]CampaignMetadata, erro
 	dateStr := yesterday.Format("20060102") // Format: YYYYMMDD (e.g., 20251021)
 
 	// Build JSON file path: campaign_intersection_20251021.json
-	jsonPath := filepath.Join(dt.OutputFolder, fmt.Sprintf("/campaign_intersection/%s/campaign_intersection_%s.json", dateStr, dateStr))
+	jsonPath := filepath.Join(dt.OutputFolder, fmt.Sprintf("/campaign_intersection/%s/campaign_devices_%s.json", dateStr, dateStr))
 
 	fmt.Printf("  📄 Reading campaign metadata from: %s\n", jsonPath)
 
