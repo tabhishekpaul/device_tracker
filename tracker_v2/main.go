@@ -1644,7 +1644,7 @@ func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	dates := []string{
-		//"2025-10-21",
+		"2025-10-21",
 		"2025-10-20",
 		"2025-10-19",
 		"2025-10-18",
@@ -1728,7 +1728,7 @@ func main() {
 
 	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
 	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{2} // Re-run to create proper files
+	runSteps := []int{3} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
