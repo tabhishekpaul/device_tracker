@@ -1208,11 +1208,27 @@ func (dt *DeviceTracker) extractDateFromPath(path string) string {
 	return ""
 }
 
-func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []int) error {
+func GetLastNDatesFromYesterday(n int) []string {
+	dates := make([]string, n)
+
+	for i := 0; i < n; i++ {
+		// Start from yesterday (i=0 is yesterday, i=1 is 2 days ago, etc.)
+		date := time.Now().AddDate(0, 0, -(i + 1))
+		dates[i] = date.Format("2006-01-02")
+	}
+
+	return dates
+}
+
+func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	yesterday := time.Now().AddDate(0, 0, -1)
+
+	yesterdayStr := yesterday.Format("2006-01-02")
+
 	dates := []string{
-		"2025-10-21",
+		yesterdayStr, // "2025-10-21",
 	}
 
 	folderList := make([]string, 0, len(dates))
@@ -1266,6 +1282,15 @@ func RunDeviceTracker(skipTimezoneError bool, runForPastDays bool, runSteps []in
 		fmt.Printf("\n%s Completed", runningSteps)
 	}
 
+	step3 := containsStep(runSteps, 3)
+
+	if step3 {
+		err := dt.RunIdleDeviceSearch(folderList, GetLastNDatesFromYesterday(7))
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	return nil
 }
 
@@ -1287,7 +1312,7 @@ func main() {
 
 	runSteps := []int{3}
 
-	err := RunDeviceTracker(true, true, runSteps)
+	err := RunDeviceTracker(runSteps)
 	if err != nil {
 		fmt.Printf("\n❌ Error: %v\n", err)
 		os.Exit(1)
