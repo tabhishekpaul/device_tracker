@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,36 +12,33 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/apache/arrow/go/v14/arrow/array"
-	"github.com/apache/arrow/go/v14/arrow/memory"
+	"github.com/apache/arrow/go/v14/parquet"
 	"github.com/apache/arrow/go/v14/parquet/file"
-	"github.com/apache/arrow/go/v14/parquet/pqarrow"
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/geo"
 )
 
 const (
-	MatchRadiusMeters = 30.0 // Buffer distance in meters
+	MatchRadiusMeters = 30.0 // Buffer distance in meters (like Python's buffer=20)
 	ParallelWorkers   = 12   // Number of parallel workers for processing parquet files
 )
 
 // ============================================================================
-// TYPES - MATCHING CONSUMERPARQUETLOADER SCHEMA
+// TYPES
 // ============================================================================
 
-// Consumer data from parquet - EXACT columns from ConsumerParquetLoader
 type ConsumerRecord struct {
-	ID              uint64  // id (UInt64 in ClickHouse)
-	Latitude        float64 // latitude
-	Longitude       float64 // longitude
-	PersonFirstName string  // PersonFirstName
-	PersonLastName  string  // PersonLastName
-	PrimaryAddress  string  // PrimaryAddress
-	TenDigitPhone   string  // TenDigitPhone
-	Email           string  // Email
-	CityName        string  // CityName
-	State           string  // State
-	ZipCode         string  // ZipCode
+	ID              string
+	Latitude        float64
+	Longitude       float64
+	PersonFirstName string
+	PersonLastName  string
+	PrimaryAddress  string
+	TenDigitPhone   string
+	Email           string
+	CityName        string
+	State           string
+	ZipCode         string
 }
 
 type IdleDevice struct {
@@ -64,7 +60,7 @@ type ConsumerDeviceMatch struct {
 	TimeVisited string `json:"Time visited"`
 
 	// Consumer info
-	ConsumerID uint64 `json:"ConsumerID"`
+	ConsumerID int64  `json:"ConsumerID"`
 	Name       string `json:"Name"`
 	Address    string `json:"Address"`
 	Email      string `json:"Email"`
@@ -103,7 +99,7 @@ type ConsumerDeviceMatcher struct {
 	totalMatches      atomic.Int64
 	processedFiles    atomic.Int64
 	uniqueDeviceSet   map[string]bool
-	uniqueConsumerSet map[uint64]bool
+	uniqueConsumerSet map[int64]bool
 }
 
 func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath string) *ConsumerDeviceMatcher {
@@ -114,7 +110,7 @@ func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath stri
 		logger:            log.New(os.Stdout, "[Step4] ", log.LstdFlags),
 		matches:           make([]ConsumerDeviceMatch, 0),
 		uniqueDeviceSet:   make(map[string]bool),
-		uniqueConsumerSet: make(map[uint64]bool),
+		uniqueConsumerSet: make(map[int64]bool),
 	}
 }
 
@@ -215,26 +211,10 @@ func (cdm *ConsumerDeviceMatcher) createBufferPolygon(lat, lon, radiusMeters flo
 func (cdm *ConsumerDeviceMatcher) processConsumerFiles() error {
 	cdm.logger.Println("Finding consumer parquet files...")
 
-	// Look for parquet files (from csv_to_parquet converter OR from consumer_raw folder)
-	patterns := []string{
-		filepath.Join(cdm.consumerFolder, "consumers_chunk_*.parquet"),
-		filepath.Join(cdm.consumerFolder, "consumer_raw_batch_*.parquet"),
-		filepath.Join(cdm.consumerFolder, "*.parquet"),
-	}
-
-	allFiles := make(map[string]bool)
-	for _, pattern := range patterns {
-		files, err := filepath.Glob(pattern)
-		if err == nil {
-			for _, f := range files {
-				allFiles[f] = true
-			}
-		}
-	}
-
-	files := make([]string, 0, len(allFiles))
-	for f := range allFiles {
-		files = append(files, f)
+	pattern := filepath.Join(cdm.consumerFolder, "*.parquet")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
 	}
 
 	if len(files) == 0 {
@@ -304,8 +284,8 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFiles() error {
 // ============================================================================
 
 func (cdm *ConsumerDeviceMatcher) processConsumerFile(fpath string) ([]ConsumerDeviceMatch, error) {
-	// Read consumers from parquet using Arrow reader (like ConsumerParquetLoader)
-	consumers, err := cdm.readConsumersFromParquetArrow(fpath)
+	// Read consumers from parquet
+	consumers, err := cdm.readConsumersFromParquet(fpath)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +322,7 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFile(fpath string) ([]ConsumerD
 					DeviceID:    device.DeviceID,
 					DateVisited: datePart,
 					TimeVisited: timePart,
-					ConsumerID:  consumer.ID,
+					ConsumerID:  cdm.parseConsumerID(consumer.ID),
 					Name:        cdm.buildName(consumer.PersonFirstName, consumer.PersonLastName),
 					Address:     consumer.PrimaryAddress,
 					Email:       consumer.Email,
@@ -364,135 +344,134 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFile(fpath string) ([]ConsumerD
 }
 
 // ============================================================================
-// READ CONSUMERS FROM PARQUET (USING ARROW LIKE CONSUMERPARQUETLOADER)
+// READ CONSUMERS FROM PARQUET
 // ============================================================================
 
-func (cdm *ConsumerDeviceMatcher) readConsumersFromParquetArrow(fpath string) ([]ConsumerRecord, error) {
-	f, err := os.Open(fpath)
+func (cdm *ConsumerDeviceMatcher) readConsumersFromParquet(fpath string) ([]ConsumerRecord, error) {
+	pf, err := file.OpenParquetFile(fpath, false)
 	if err != nil {
-		return nil, fmt.Errorf("error opening file: %w", err)
+		return nil, err
 	}
-	defer f.Close()
+	defer pf.Close()
 
-	reader, err := file.NewParquetReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create parquet reader: %w", err)
+	schema := pf.MetaData().Schema
+	colIndex := make(map[string]int)
+	for i := 0; i < schema.NumColumns(); i++ {
+		colIndex[schema.Column(i).Name()] = i
 	}
-	defer reader.Close()
-
-	arrowReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{BatchSize: 1024}, memory.NewGoAllocator())
-	if err != nil {
-		return nil, fmt.Errorf("failed to create arrow reader: %w", err)
-	}
-
-	ctx := context.Background()
-	recordReader, err := arrowReader.GetRecordReader(ctx, nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get record reader: %w", err)
-	}
-	defer recordReader.Release()
 
 	consumers := make([]ConsumerRecord, 0)
 
-	for recordReader.Next() {
-		rec := recordReader.Record()
-		rows := int(rec.NumRows())
-		fields := rec.Schema().Fields()
+	numRowGroups := pf.NumRowGroups()
+	for rgIdx := 0; rgIdx < numRowGroups; rgIdx++ {
+		rg := pf.RowGroup(rgIdx)
+		numRows := int(rg.NumRows())
 
-		colIndex := make(map[string]int)
-		for i, f := range fields {
-			colIndex[f.Name] = i
-		}
+		// Read all columns
+		ids := cdm.readStringColumnRaw(rg, colIndex["id"], numRows)
+		lats := cdm.readFloatColumnRaw(rg, colIndex["Latitude"], numRows)
+		lons := cdm.readFloatColumnRaw(rg, colIndex["Longitude"], numRows)
+		firstNames := cdm.readStringColumnRaw(rg, colIndex["PersonFirstName"], numRows)
+		lastNames := cdm.readStringColumnRaw(rg, colIndex["PersonLastName"], numRows)
+		addresses := cdm.readStringColumnRaw(rg, colIndex["PrimaryAddress"], numRows)
+		phones := cdm.readStringColumnRaw(rg, colIndex["TenDigitPhone"], numRows)
+		emails := cdm.readStringColumnRaw(rg, colIndex["Email"], numRows)
+		cities := cdm.readStringColumnRaw(rg, colIndex["CityName"], numRows)
+		states := cdm.readStringColumnRaw(rg, colIndex["State"], numRows)
+		zips := cdm.readStringColumnRaw(rg, colIndex["ZipCode"], numRows)
 
-		for i := 0; i < rows; i++ {
-			consumer := ConsumerRecord{}
-
-			// Read id (UInt64 or Int64 or String)
-			if idx, ok := colIndex["id"]; ok {
-				switch col := rec.Column(idx).(type) {
-				case *array.Uint64:
-					consumer.ID = col.Value(i)
-				case *array.Int64:
-					consumer.ID = uint64(col.Value(i))
-				case *array.String:
-					fmt.Sscanf(col.Value(i), "%d", &consumer.ID)
-				}
-			}
-
-			// Read latitude
-			if idx, ok := colIndex["latitude"]; ok {
-				switch col := rec.Column(idx).(type) {
-				case *array.Float64:
-					consumer.Latitude = col.Value(i)
-				case *array.Float32:
-					consumer.Latitude = float64(col.Value(i))
-				}
-			}
-
-			// Read longitude
-			if idx, ok := colIndex["longitude"]; ok {
-				switch col := rec.Column(idx).(type) {
-				case *array.Float64:
-					consumer.Longitude = col.Value(i)
-				case *array.Float32:
-					consumer.Longitude = float64(col.Value(i))
-				}
-			}
-
+		// Build records
+		for i := 0; i < numRows; i++ {
 			// Validate coordinates
-			if consumer.Latitude < -90 || consumer.Latitude > 90 ||
-				consumer.Longitude < -180 || consumer.Longitude > 180 {
+			if lats[i] < -90 || lats[i] > 90 || lons[i] < -180 || lons[i] > 180 {
 				continue
 			}
 
-			// Read string fields
-			if idx, ok := colIndex["PersonFirstName"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok {
-					consumer.PersonFirstName = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["PersonLastName"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok {
-					consumer.PersonLastName = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["PrimaryAddress"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok {
-					consumer.PrimaryAddress = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["TenDigitPhone"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok {
-					consumer.TenDigitPhone = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["Email"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok {
-					consumer.Email = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["CityName"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok {
-					consumer.CityName = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["State"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok {
-					consumer.State = col.Value(i)
-				}
-			}
-			if idx, ok := colIndex["ZipCode"]; ok {
-				if col, ok := rec.Column(idx).(*array.String); ok {
-					consumer.ZipCode = col.Value(i)
-				}
-			}
-
-			consumers = append(consumers, consumer)
+			consumers = append(consumers, ConsumerRecord{
+				ID:              ids[i],
+				Latitude:        lats[i],
+				Longitude:       lons[i],
+				PersonFirstName: firstNames[i],
+				PersonLastName:  lastNames[i],
+				PrimaryAddress:  addresses[i],
+				TenDigitPhone:   phones[i],
+				Email:           emails[i],
+				CityName:        cities[i],
+				State:           states[i],
+				ZipCode:         zips[i],
+			})
 		}
-		rec.Release()
 	}
 
 	return consumers, nil
+}
+
+// ============================================================================
+// PARQUET COLUMN READERS
+// ============================================================================
+
+func (cdm *ConsumerDeviceMatcher) readStringColumnRaw(rg *file.RowGroupReader, colIdx int, numRows int) []string {
+	col, err := rg.Column(colIdx)
+	if err != nil {
+		return make([]string, numRows)
+	}
+
+	result := make([]string, 0, numRows)
+
+	switch reader := col.(type) {
+	case *file.ByteArrayColumnChunkReader:
+		values := make([]parquet.ByteArray, 8192)
+		defLevels := make([]int16, 8192)
+		maxDefLevel := reader.Descriptor().MaxDefinitionLevel()
+
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
+			if n == 0 {
+				break
+			}
+			for i := 0; i < int(n); i++ {
+				if maxDefLevel == 0 || defLevels[i] > 0 {
+					result = append(result, string(values[i]))
+				} else {
+					result = append(result, "")
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+func (cdm *ConsumerDeviceMatcher) readFloatColumnRaw(rg *file.RowGroupReader, colIdx int, numRows int) []float64 {
+	col, err := rg.Column(colIdx)
+	if err != nil {
+		return make([]float64, numRows)
+	}
+
+	result := make([]float64, 0, numRows)
+
+	switch reader := col.(type) {
+	case *file.Float64ColumnChunkReader:
+		values := make([]float64, 8192)
+		defLevels := make([]int16, 8192)
+		maxDefLevel := reader.Descriptor().MaxDefinitionLevel()
+
+		for {
+			n, _, _ := reader.ReadBatch(int64(len(values)), values, defLevels, nil)
+			if n == 0 {
+				break
+			}
+			for i := 0; i < int(n); i++ {
+				if maxDefLevel == 0 || defLevels[i] > 0 {
+					result = append(result, values[i])
+				} else {
+					result = append(result, 0.0)
+				}
+			}
+		}
+	}
+
+	return result
 }
 
 // ============================================================================
@@ -558,6 +537,12 @@ func (cdm *ConsumerDeviceMatcher) buildName(firstName, lastName string) string {
 		return ""
 	}
 	return strings.TrimSpace(firstName + " " + lastName)
+}
+
+func (cdm *ConsumerDeviceMatcher) parseConsumerID(idStr string) int64 {
+	var id int64
+	fmt.Sscanf(idStr, "%d", &id)
+	return id
 }
 
 // Math helpers
