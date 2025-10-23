@@ -1644,11 +1644,13 @@ func GetLastNDatesFromYesterday(n int) []string {
 func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	/*yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
 	ydates := []string{
 		yesterday,
-	}
+	}*/
+
+	ydates := GetLastNDatesFromYesterday(7)
 
 	yfolderList := make([]string, 0, len(ydates))
 	for _, d := range ydates {
@@ -1749,7 +1751,7 @@ func main() {
 
 	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
 	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{4} // Re-run to create proper files
+	runSteps := []int{1, 2, 3, 4} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
