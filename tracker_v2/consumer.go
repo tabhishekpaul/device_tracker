@@ -91,15 +91,17 @@ type ConsumerDeviceMatcher struct {
 	matchedDevices     map[string]bool
 	totalMatches       atomic.Int64
 	processedFiles     atomic.Int64
+	processedDate      string
 	validConsumers     atomic.Int64
 	invalidConsumers   atomic.Int64
 	uniqueDeviceSet    map[string]bool
 	uniqueConsumerSet  map[uint64]bool
 }
 
-func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath string) *ConsumerDeviceMatcher {
+func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath string, processedDate string) *ConsumerDeviceMatcher {
 	return &ConsumerDeviceMatcher{
 		outputFolder:       outputFolder,
+		processedDate:      processedDate,
 		consumerFolder:     consumerFolder,
 		idleDevicesPath:    idleDevicesPath,
 		logger:             log.New(os.Stdout, "[Step4] ", log.LstdFlags),
@@ -567,8 +569,7 @@ func (cdm *ConsumerDeviceMatcher) Run() error {
 
 	elapsed := time.Since(startTime)
 
-	processedDate := time.Now().Format("2006-01-02")
-	if err := cdm.saveMatches(processedDate, elapsed.Milliseconds()); err != nil {
+	if err := cdm.saveMatches(cdm.processedDate, elapsed.Milliseconds()); err != nil {
 		return fmt.Errorf("failed to save matches: %w", err)
 	}
 

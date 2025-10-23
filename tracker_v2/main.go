@@ -1718,7 +1718,7 @@ func RunDeviceTracker(runSteps []int) error {
 		consumerFolder := filepath.Join(outputFolder, "consumers")
 		idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", yesterday))
 
-		matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath)
+		matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, yesterday)
 
 		if err := matcher.Run(); err != nil {
 			log.Fatalf("Error: %v", err)
