@@ -256,6 +256,19 @@ type RowGroupResult struct {
 	Error   error
 }
 
+// Add this struct (if not already present) - with Campaign ID field
+type DeviceIntersectionMongoDocument struct {
+	ID            primitive.ObjectID    `bson:"_id,omitempty"`
+	POIID         primitive.ObjectID    `bson:"poi_id"`
+	POIName       string                `bson:"poi_name"`
+	CampaignID    primitive.ObjectID    `bson:"campaign_id"`
+	CampaignName  string                `bson:"campaign_name"`
+	ProcessedDate string                `bson:"processed_date"`
+	DeviceCount   int                   `bson:"device_count"`
+	Devices       []MinimalDeviceRecord `bson:"devices"`
+	CreatedAt     time.Time             `bson:"created_at"`
+}
+
 // ============================================================================
 // CONSTRUCTOR
 // ============================================================================
@@ -321,6 +334,71 @@ func (dt *DeviceTracker) Close() {
 	if dt.mongoClient != nil {
 		dt.mongoClient.Disconnect(dt.ctx)
 	}
+}
+
+// MongoDB saving function - adapted for new code structure
+func (dt *DeviceTracker) saveDeviceIntersectionsToMongoDB(
+	campaignMap map[string]map[string][]MinimalDeviceRecord,
+	dateStr string,
+) error {
+	if dt.mongoCollection == nil {
+		fmt.Println("⚠️  MongoDB not configured, skipping MongoDB save")
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	documents := make([]interface{}, 0)
+	createdAt := time.Now()
+
+	for campaignID, poiMap := range campaignMap {
+		campaignObjID, err := primitive.ObjectIDFromHex(campaignID)
+		if err != nil {
+			fmt.Printf("⚠️  Invalid Campaign ID: %s, skipping: %v\n", campaignID, err)
+			continue
+		}
+
+		for key, devices := range poiMap {
+			// Parse key: "poiID|poiName|campaignName"
+			parts := strings.Split(key, "|")
+			if len(parts) != 3 {
+				continue
+			}
+			poiID, poiName, campaignName := parts[0], parts[1], parts[2]
+
+			poiObjID, err := primitive.ObjectIDFromHex(poiID)
+			if err != nil {
+				fmt.Printf("⚠️  Invalid POI ID: %s, skipping: %v\n", poiID, err)
+				continue
+			}
+
+			doc := DeviceIntersectionMongoDocument{
+				POIID:         poiObjID,
+				POIName:       poiName,
+				CampaignID:    campaignObjID,
+				CampaignName:  campaignName,
+				ProcessedDate: dateStr,
+				DeviceCount:   len(devices),
+				Devices:       devices,
+				CreatedAt:     createdAt,
+			}
+			documents = append(documents, doc)
+		}
+	}
+
+	if len(documents) == 0 {
+		fmt.Println("⚠️  No documents to insert into MongoDB")
+		return nil
+	}
+
+	result, err := dt.mongoCollection.InsertMany(ctx, documents)
+	if err != nil {
+		return fmt.Errorf("failed to insert documents into MongoDB: %w", err)
+	}
+
+	fmt.Printf("✅ Successfully inserted %d POI documents into MongoDB\n", len(result.InsertedIDs))
+	return nil
 }
 
 // ============================================================================
@@ -1164,6 +1242,14 @@ func (dt *DeviceTracker) saveCampaignIntersectionJSON(deviceMap map[string]map[s
 		campaignMap[campaignID][key] = append(campaignMap[campaignID][key], deviceRecord)
 	}
 
+	// 💾 SAVE TO MONGODB HERE - Now campaignMap has the correct type
+	fmt.Println("\n💾 Saving device intersections to MongoDB...")
+	if err := dt.saveDeviceIntersectionsToMongoDB(campaignMap, dateStr); err != nil {
+		fmt.Printf("⚠️  Warning: MongoDB save failed: %v\n", err)
+		// Continue to JSON save even if MongoDB fails
+	}
+
+	// Rest of your existing code for JSON saving...
 	campaigns := make([]CampaignDevices, 0)
 	totalDevices := 0
 
@@ -1751,7 +1837,7 @@ func main() {
 
 	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
 	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{1, 2, 3, 4} // Re-run to create proper files
+	runSteps := []int{1} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
