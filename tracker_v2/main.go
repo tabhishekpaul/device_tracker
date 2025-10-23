@@ -37,7 +37,6 @@ const (
 	rowGroupWorkers  = 48
 	fileWorkers      = 16
 	step3Workers     = 48
-	channelBuffer    = 100
 )
 
 type MongoConfig struct {
