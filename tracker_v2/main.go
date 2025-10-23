@@ -1642,9 +1642,10 @@ func GetLastNDatesFromYesterday(n int) []string {
 
 func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
 	dates := []string{
-		"2025-10-22",
+		yesterday,
 	}
 
 	folderList := make([]string, 0, len(dates))
@@ -1738,7 +1739,7 @@ func main() {
 
 	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
 	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{4} // Re-run to create proper files
+	runSteps := []int{1, 2, 3} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
