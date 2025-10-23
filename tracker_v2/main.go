@@ -104,6 +104,9 @@ type DeviceTracker struct {
 	mongoClient     *mongo.Client
 	mongoCollection *mongo.Collection
 	mongoConfig     MongoConfig
+
+	// 🆕 Store detected timezone from source files
+	sourceTimezone string
 }
 
 type ParquetWriter struct {
@@ -277,6 +280,7 @@ func NewDeviceTracker(campaignAPIURL, outputFolder string, mongoConfig MongoConf
 		NumWorkers:       workerPoolSize,
 		mongoConfig:      mongoConfig,
 		numWriters:       8,
+		sourceTimezone:   "", // Will be detected from source files
 	}
 
 	dt.parseTimeFilters()
@@ -296,7 +300,7 @@ func (dt *DeviceTracker) parseTimeFilters() {
 	dt.endSeconds = dt.filterEndHour*3600 + dt.filterEndMin*60 + dt.filterEndSec
 
 	fmt.Printf("⚙️  Cores: %d | Workers: %d | RAM: 386GB\n", runtime.NumCPU(), workerPoolSize)
-	fmt.Printf("⚙️  Time filter: %s to %s\n", dt.FilterInTime, dt.FilterOutTime)
+	fmt.Printf("⚙️  Time filter: %s to %s (LOCAL TIME)\n", dt.FilterInTime, dt.FilterOutTime)
 }
 
 func (dt *DeviceTracker) connectMongoDB() error {
@@ -321,6 +325,52 @@ func (dt *DeviceTracker) Close() {
 	if dt.mongoClient != nil {
 		dt.mongoClient.Disconnect(dt.ctx)
 	}
+}
+
+// ============================================================================
+// TIMEZONE DETECTION
+// ============================================================================
+
+// 🆕 Detect timezone from source parquet file
+func (dt *DeviceTracker) detectSourceTimezone(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	reader, err := file.NewParquetReader(f)
+	if err != nil {
+		return "", err
+	}
+	defer reader.Close()
+
+	arrowReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{}, memory.NewGoAllocator())
+	if err != nil {
+		return "", err
+	}
+
+	schema, err := arrowReader.Schema()
+	if err != nil {
+		return "", err
+	}
+
+	// Find timestamp column and get its timezone
+	for i := 0; i < schema.NumFields(); i++ {
+		field := schema.Field(i)
+		if field.Name == dt.TimeColumnName {
+			if tsType, ok := field.Type.(*arrow.TimestampType); ok {
+				if tsType.TimeZone != "" {
+					fmt.Printf("✅ Detected timezone from source: %s\n", tsType.TimeZone)
+					return tsType.TimeZone, nil
+				}
+			}
+		}
+	}
+
+	// No timezone found, use UTC as default
+	fmt.Printf("⚠️  No timezone in source, using UTC\n")
+	return "UTC", nil
 }
 
 // ============================================================================
@@ -446,6 +496,19 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(folderPath string, ru
 		return fmt.Errorf("could not extract date from path: %s", folderPath)
 	}
 
+	// 🆕 Detect timezone from first file
+	if dt.sourceTimezone == "" {
+		files, _ := filepath.Glob(filepath.Join(folderPath, "*.parquet"))
+		if len(files) > 0 {
+			tz, err := dt.detectSourceTimezone(files[0])
+			if err == nil {
+				dt.sourceTimezone = tz
+			} else {
+				dt.sourceTimezone = "UTC"
+			}
+		}
+	}
+
 	if runStep1 {
 		fmt.Printf("\n🚀 STEP 1: Campaign Intersection [%s] - %d WORKERS\n", dateStr, fileWorkers)
 		start := time.Now()
@@ -460,6 +523,7 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(folderPath string, ru
 
 	if runStep2 {
 		fmt.Printf("\n🚀 STEP 2: Time Filtering [%s] - %d WRITERS\n", dateStr, dt.numWriters)
+		fmt.Printf("📍 Using timezone: %s for LOCAL time filtering\n", dt.sourceTimezone)
 		start := time.Now()
 
 		if err := dt.initParquetWriters(dateStr); err != nil {
@@ -472,7 +536,7 @@ func (dt *DeviceTracker) FindCampaignIntersectionForFolder(folderPath string, ru
 
 		dt.closeParquetWriters()
 
-		// 🆕 NEW: Merge parquet files by event date
+		// Merge parquet files by event date
 		if err := dt.mergeParquetFilesByEventDate(dateStr); err != nil {
 			return fmt.Errorf("failed to merge parquet files: %w", err)
 		}
@@ -673,32 +737,31 @@ func (dt *DeviceTracker) saveToMongoDB(campaigns []CampaignDevices, dateStr stri
 }
 
 // ============================================================================
-// STEP 2: TIME FILTERING WITH PARQUET
+// STEP 2: TIME FILTERING WITH TIMEZONE-AWARE PARQUET
 // ============================================================================
 
-// 🆕 MODIFIED: Changed output directory to time_filtered instead of load_date subfolder
+// 🆕 MODIFIED: Use source timezone for schema
 func (dt *DeviceTracker) initParquetWriters(loadDate string) error {
 	dt.parquetWriterMutex.Lock()
 	defer dt.parquetWriterMutex.Unlock()
 
 	dt.parquetWriters = make([]*ParquetWriter, dt.numWriters)
 
-	// 🆕 NEW: Use time_filtered folder instead of load_date folder
 	outputDir := filepath.Join(dt.OutputFolder, "time_filtered")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
+	// 🔧 CRITICAL: Use source timezone to preserve local time
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "device_id", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "event_timestamp", Type: arrow.FixedWidthTypes.Timestamp_us, Nullable: false},
+		{Name: "event_timestamp", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: dt.sourceTimezone}, Nullable: false},
 		{Name: "latitude", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
 		{Name: "longitude", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
-		{Name: "load_date", Type: arrow.FixedWidthTypes.Timestamp_us, Nullable: false},
+		{Name: "load_date", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: dt.sourceTimezone}, Nullable: false},
 	}, nil)
 
 	for i := 0; i < dt.numWriters; i++ {
-		// 🆕 MODIFIED: Keep part files temporarily during processing
 		filename := filepath.Join(outputDir, fmt.Sprintf("time_filtered_part_%s_%02d.parquet", strings.ReplaceAll(loadDate, "-", ""), i))
 
 		file, err := os.Create(filename)
@@ -784,13 +847,15 @@ func (dt *DeviceTracker) timeFilterWorker(workerID int, jobs <-chan string, load
 
 		batch := make([]TimeFilteredRecord, 0)
 		for _, rec := range records {
+			// 🔧 CRITICAL: Filter based on LOCAL time (hour, minute, second)
+			// NOT converting timezone - keeping original local time
 			eventTime := rec.EventTimestamp
 			seconds := eventTime.Hour()*3600 + eventTime.Minute()*60 + eventTime.Second()
 
 			if seconds >= dt.startSeconds && seconds <= dt.endSeconds {
 				batch = append(batch, TimeFilteredRecord{
 					DeviceID:       rec.DeviceID,
-					EventTimestamp: rec.EventTimestamp,
+					EventTimestamp: rec.EventTimestamp, // Preserve original timestamp with timezone
 					Latitude:       rec.Latitude,
 					Longitude:      rec.Longitude,
 					LoadDate:       loadDateTime,
@@ -833,16 +898,17 @@ func (dt *DeviceTracker) flushParquetBatch(writerID int) {
 	}
 }
 
+// 🔧 Use source timezone in builders
 func (dt *DeviceTracker) writeParquetBatch(pw *ParquetWriter) {
 	if len(pw.batch) == 0 {
 		return
 	}
 
 	deviceIDBuilder := array.NewStringBuilder(memory.DefaultAllocator)
-	timestampBuilder := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond})
+	timestampBuilder := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: dt.sourceTimezone})
 	latBuilder := array.NewFloat64Builder(memory.DefaultAllocator)
 	lonBuilder := array.NewFloat64Builder(memory.DefaultAllocator)
-	loadDateBuilder := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond})
+	loadDateBuilder := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: dt.sourceTimezone})
 
 	for _, rec := range pw.batch {
 		deviceIDBuilder.Append(rec.DeviceID)
@@ -890,11 +956,13 @@ func (dt *DeviceTracker) closeParquetWriters() {
 	}
 }
 
-// 🆕 NEW FUNCTION: Merge parquet files by event date
+// ============================================================================
+// MERGE BY EVENT DATE
+// ============================================================================
+
 func (dt *DeviceTracker) mergeParquetFilesByEventDate(loadDate string) error {
 	timeFilteredDir := filepath.Join(dt.OutputFolder, "time_filtered")
 
-	// Find all part files from this run
 	partPattern := filepath.Join(timeFilteredDir,
 		fmt.Sprintf("time_filtered_part_%s_*.parquet", strings.ReplaceAll(loadDate, "-", "")))
 	partFiles, err := filepath.Glob(partPattern)
@@ -905,7 +973,6 @@ func (dt *DeviceTracker) mergeParquetFilesByEventDate(loadDate string) error {
 
 	fmt.Printf("\n📦 Merging %d part files by event date...\n", len(partFiles))
 
-	// Group records by event date
 	recordsByEventDate := make(map[string][]TimeFilteredRecord)
 
 	for _, partFile := range partFiles {
@@ -916,20 +983,19 @@ func (dt *DeviceTracker) mergeParquetFilesByEventDate(loadDate string) error {
 		}
 
 		for _, rec := range records {
+			// 🔧 Use local date (not UTC date) for grouping
 			eventDate := rec.EventTimestamp.Format("20060102")
 			recordsByEventDate[eventDate] = append(recordsByEventDate[eventDate], rec)
 		}
 
-		os.Remove(partFile) // Clean up part file
+		os.Remove(partFile)
 	}
 
-	// Write/append one file per event date
 	for eventDate, records := range recordsByEventDate {
 		outputFile := filepath.Join(timeFilteredDir,
 			fmt.Sprintf("time_filtered_%s.parquet", eventDate))
 
 		if _, err := os.Stat(outputFile); err == nil {
-			// File exists - append
 			fmt.Printf("   📝 Appending %d records to time_filtered_%s.parquet\n",
 				len(records), eventDate)
 			existingRecords, _ := dt.readTimeFilteredParquet(outputFile)
@@ -986,6 +1052,7 @@ func (dt *DeviceTracker) readTimeFilteredParquet(filePath string) ([]TimeFiltere
 				record.DeviceID = col.Value(i)
 			}
 			if col, ok := rec.Column(1).(*array.Timestamp); ok {
+				// Timestamp preserves timezone
 				record.EventTimestamp = col.Value(i).ToTime(arrow.Microsecond)
 			}
 			if col, ok := rec.Column(2).(*array.Float64); ok {
@@ -1006,6 +1073,7 @@ func (dt *DeviceTracker) readTimeFilteredParquet(filePath string) ([]TimeFiltere
 	return allRecords, nil
 }
 
+// 🔧 Use source timezone in write function
 func (dt *DeviceTracker) writeTimeFilteredParquet(filePath string, records []TimeFilteredRecord) error {
 	file, err := os.Create(filePath)
 	if err != nil {
@@ -1015,10 +1083,10 @@ func (dt *DeviceTracker) writeTimeFilteredParquet(filePath string, records []Tim
 
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "device_id", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "event_timestamp", Type: arrow.FixedWidthTypes.Timestamp_us, Nullable: false},
+		{Name: "event_timestamp", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: dt.sourceTimezone}, Nullable: false},
 		{Name: "latitude", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
 		{Name: "longitude", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
-		{Name: "load_date", Type: arrow.FixedWidthTypes.Timestamp_us, Nullable: false},
+		{Name: "load_date", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: dt.sourceTimezone}, Nullable: false},
 	}, nil)
 
 	writerProps := parquet.NewWriterProperties(
@@ -1043,10 +1111,10 @@ func (dt *DeviceTracker) writeTimeFilteredParquet(filePath string, records []Tim
 		batch := records[i:end]
 
 		deviceIDBuilder := array.NewStringBuilder(memory.DefaultAllocator)
-		timestampBuilder := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond})
+		timestampBuilder := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: dt.sourceTimezone})
 		latBuilder := array.NewFloat64Builder(memory.DefaultAllocator)
 		lonBuilder := array.NewFloat64Builder(memory.DefaultAllocator)
-		loadDateBuilder := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond})
+		loadDateBuilder := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: dt.sourceTimezone})
 
 		for _, rec := range batch {
 			deviceIDBuilder.Append(rec.DeviceID)
@@ -1099,7 +1167,6 @@ func (dt *DeviceTracker) RunIdleDeviceSearch(folderList, dates []string) error {
 		loadDate := dates[idx]
 		fmt.Printf("\n📅 Processing %s\n", loadDate)
 
-		// 🆕 MODIFIED: Use time_filtered folder instead of load_date folder
 		timeFilteredDir := filepath.Join(dt.OutputFolder, "time_filtered")
 		eventDate := strings.ReplaceAll(loadDate, "-", "")
 		timeFilteredFile := filepath.Join(timeFilteredDir, fmt.Sprintf("time_filtered_%s.parquet", eventDate))
@@ -1127,13 +1194,10 @@ func (dt *DeviceTracker) RunIdleDeviceSearch(folderList, dates []string) error {
 	fmt.Printf("\n✅ Total idle devices across all dates: %d\n", totalIdle)
 	fmt.Printf("⏱️  Processing time: %.2fs\n", elapsed.Seconds())
 
-	// 🆕 MODIFIED: Save one file per load_date
 	return dt.saveIdleDevicesSeparateFiles(allIdleDevicesByDate, elapsed)
 }
 
-// 🆕 NEW FUNCTION: Save idle devices as separate files per load_date
 func (dt *DeviceTracker) saveIdleDevicesSeparateFiles(allIdleDevicesByDate map[string][]IdleDeviceResult, elapsed time.Duration) error {
-	// Create idle_devices directory
 	idleDevicesDir := filepath.Join(dt.OutputFolder, "idle_devices")
 	if err := os.MkdirAll(idleDevicesDir, 0755); err != nil {
 		return fmt.Errorf("failed to create idle_devices directory: %w", err)
@@ -1141,7 +1205,6 @@ func (dt *DeviceTracker) saveIdleDevicesSeparateFiles(allIdleDevicesByDate map[s
 
 	fmt.Println("\n📁 Saving idle devices to separate files...")
 
-	// Save one file per load_date
 	for loadDate, devices := range allIdleDevicesByDate {
 		output := IdleDevicesByDate{
 			EventDate:        loadDate,
@@ -1180,20 +1243,17 @@ func (dt *DeviceTracker) findIdleDevices(timeFilteredFile, loadDate string) ([]I
 
 	fmt.Printf("   Loaded %d time-filtered records\n", len(records))
 
-	// Group by device_id
 	deviceRecords := make(map[string][]TimeFilteredRecord)
 	for _, rec := range records {
 		deviceRecords[rec.DeviceID] = append(deviceRecords[rec.DeviceID], rec)
 	}
 
-	// Sort each device's records by time
 	for deviceID := range deviceRecords {
 		sort.Slice(deviceRecords[deviceID], func(i, j int) bool {
 			return deviceRecords[deviceID][i].EventTimestamp.Before(deviceRecords[deviceID][j].EventTimestamp)
 		})
 	}
 
-	// Find idle devices
 	idleDevices := make([]IdleDeviceResult, 0)
 	processedCount := 0
 
@@ -1222,7 +1282,6 @@ func (dt *DeviceTracker) findIdleDevices(timeFilteredFile, loadDate string) ([]I
 		}
 
 		if isIdle {
-			// Find which POI this device is in
 			intersections := dt.findIntersectingLocations(firstPoint)
 			if len(intersections) > 0 {
 				dt.LocDataMutex.RLock()
@@ -1490,7 +1549,6 @@ func GetLastNDatesFromYesterday(n int) []string {
 
 func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	/*yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
 	dates := []string{
@@ -1556,7 +1614,6 @@ func RunDeviceTracker(runSteps []int) error {
 	if step4 {
 		yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
-		// 🆕 MODIFIED: Use new folder structure paths
 		consumerFolder := filepath.Join(outputFolder, "consumers")
 		idleDevicesPath := filepath.Join(outputFolder, "idle_devices",
 			fmt.Sprintf("idle_devices_%s.json", yesterday))
@@ -1582,9 +1639,8 @@ func containsStep(steps []int, step int) bool {
 
 func main() {
 	fmt.Println("╔═══════════════════════════════════════════════════════╗")
-	fmt.Println("║     DEVICE TRACKER - HYPER-PARALLEL EDITION          ║")
-	fmt.Println("║     48 CORES | 386GB RAM | 2000%+ CPU TARGET         ║")
-	fmt.Println("║     NEW: Event-Date Based Structure                  ║")
+	fmt.Println("║     DEVICE TRACKER - TIMEZONE-AWARE EDITION          ║")
+	fmt.Println("║     48 CORES | 386GB RAM | LOCAL TIME FILTERING      ║")
 	fmt.Println("╚═══════════════════════════════════════════════════════╝")
 
 	startTime := time.Now()
