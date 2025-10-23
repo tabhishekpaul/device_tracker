@@ -142,8 +142,11 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 	}
 	defer file.Close()
 
+	// 🆕 MODIFIED: Load from new structure with event_date field
 	var idleData struct {
-		IdleDevicesByDate map[string][]struct {
+		EventDate        string `json:"event_date"`
+		TotalIdleDevices int    `json:"total_idle_devices"`
+		IdleDevices      []struct {
 			DeviceID    string `json:"device_id"`
 			VisitedTime string `json:"visited_time"`
 			Address     string `json:"address"`
@@ -151,7 +154,7 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 			CampaignID  string `json:"campaign_id"`
 			POIID       string `json:"poi_id"`
 			Geometry    string `json:"geometry"`
-		} `json:"idle_devices_by_date"`
+		} `json:"idle_devices"`
 	}
 
 	decoder := json.NewDecoder(file)
@@ -160,25 +163,23 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 	}
 
 	totalDevices := 0
-	for _, devices := range idleData.IdleDevicesByDate {
-		for _, device := range devices {
-			lat, lon := cdm.parsePoint(device.Geometry)
+	for _, device := range idleData.IdleDevices {
+		lat, lon := cdm.parsePoint(device.Geometry)
 
-			idleDevice := IdleDevice{
-				DeviceID:    device.DeviceID,
-				VisitedTime: device.VisitedTime,
-				Address:     device.Address,
-				Campaign:    device.Campaign,
-				CampaignID:  device.CampaignID,
-				POIID:       device.POIID,
-				Latitude:    lat,
-				Longitude:   lon,
-			}
-
-			cellKey := getCellKey(lat, lon)
-			cdm.deviceSpatialIndex[cellKey] = append(cdm.deviceSpatialIndex[cellKey], idleDevice)
-			totalDevices++
+		idleDevice := IdleDevice{
+			DeviceID:    device.DeviceID,
+			VisitedTime: device.VisitedTime,
+			Address:     device.Address,
+			Campaign:    device.Campaign,
+			CampaignID:  device.CampaignID,
+			POIID:       device.POIID,
+			Latitude:    lat,
+			Longitude:   lon,
 		}
+
+		cellKey := getCellKey(lat, lon)
+		cdm.deviceSpatialIndex[cellKey] = append(cdm.deviceSpatialIndex[cellKey], idleDevice)
+		totalDevices++
 	}
 
 	cdm.logger.Printf("✅ Loaded %d idle devices in %d grid cells", totalDevices, len(cdm.deviceSpatialIndex))
@@ -223,8 +224,9 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFiles() error {
 	cdm.logger.Println("Finding consumer parquet files...")
 
 	patterns := []string{
-		filepath.Join(cdm.consumerFolder, "consumer_raw_batch_*.parquet"),
-		filepath.Join(cdm.consumerFolder, "consumers_chunk_*.parquet"),
+		filepath.Join(cdm.consumerFolder, "consumers_*.parquet"),          // 🆕 NEW: date-based files
+		filepath.Join(cdm.consumerFolder, "consumer_raw_batch_*.parquet"), // OLD: fallback
+		filepath.Join(cdm.consumerFolder, "consumers_chunk_*.parquet"),    // OLD: fallback
 		filepath.Join(cdm.consumerFolder, "*.parquet"),
 	}
 
