@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	MatchRadiusMeters = 30.0
-	ParallelWorkers   = 12
+	MatchRadiusMeters = 8.0
+	ParallelWorkers   = 48
 	GridSize          = 0.001
 )
 
