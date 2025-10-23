@@ -1644,21 +1644,19 @@ func GetLastNDatesFromYesterday(n int) []string {
 func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	/*yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
-	dates := []string{
+	ydates := []string{
 		yesterday,
-	}*/
-
-	dates := GetLastNDatesFromYesterday(7)
-
-	folderList := make([]string, 0, len(dates))
-	for _, d := range dates {
-		folder := "load_date=" + strings.ReplaceAll(d, "-", "")
-		folderList = append(folderList, folder)
 	}
 
-	fmt.Printf("📅 Dates: %v\n", dates)
+	yfolderList := make([]string, 0, len(ydates))
+	for _, d := range ydates {
+		folder := "load_date=" + strings.ReplaceAll(d, "-", "")
+		yfolderList = append(yfolderList, folder)
+	}
+
+	fmt.Printf("📅 Dates: %v\n", ydates)
 
 	mongoConfig := MongoConfig{
 		URI:        "mongodb://admin:nyros%4006@localhost:27017",
@@ -1691,12 +1689,20 @@ func RunDeviceTracker(runSteps []int) error {
 
 	if step1 || step2 {
 		fmt.Printf("\n🚀 HYPER-PARALLEL MODE: %d CORES\n", runtime.NumCPU())
-		for _, folder := range folderList {
+		for _, folder := range yfolderList {
 			err := dt.FindCampaignIntersectionForFolder("/mnt/blobcontainer/"+folder, step1, step2)
 			if err != nil {
 				fmt.Printf("❌ Error: %v\n", err)
 			}
 		}
+	}
+
+	dates := GetLastNDatesFromYesterday(7)
+
+	folderList := make([]string, 0, len(dates))
+	for _, d := range dates {
+		folder := "load_date=" + strings.ReplaceAll(d, "-", "")
+		folderList = append(folderList, folder)
 	}
 
 	if step3 {
@@ -1743,7 +1749,7 @@ func main() {
 
 	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
 	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{1, 2, 3} // Re-run to create proper files
+	runSteps := []int{4} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
