@@ -22,9 +22,9 @@ import (
 )
 
 const (
-	MatchRadiusMeters = 8.0
+	MatchRadiusMeters = 8
 	ParallelWorkers   = 48
-	GridSize          = 0.001
+	GridSize          = 0.00008
 )
 
 type ConsumerRecord struct {
