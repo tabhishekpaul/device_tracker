@@ -48,6 +48,8 @@ type IdleDevice struct {
 	Campaign    string
 	Latitude    float64
 	Longitude   float64
+	CampaignID  string
+	POIID       string
 }
 
 type ConsumerDeviceMatch struct {
@@ -63,6 +65,9 @@ type ConsumerDeviceMatch struct {
 	ZipCode     string `json:"ZipCode"`
 	POI         string `json:"POI"`
 	Campaign    string `json:"Campaign"`
+	Phone       string `json:"Phone"`
+	CampaignID  string `json:"CampaignID"`
+	POIID       string `json:"POIID"`
 }
 
 type MatchOutputJSON struct {
@@ -143,6 +148,8 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 			VisitedTime string `json:"visited_time"`
 			Address     string `json:"address"`
 			Campaign    string `json:"campaign"`
+			CampaignID  string `json:"campaign_id"`
+			POIID       string `json:"poi_id"`
 			Geometry    string `json:"geometry"`
 		} `json:"idle_devices_by_date"`
 	}
@@ -162,6 +169,8 @@ func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
 				VisitedTime: device.VisitedTime,
 				Address:     device.Address,
 				Campaign:    device.Campaign,
+				CampaignID:  device.CampaignID,
+				POIID:       device.POIID,
 				Latitude:    lat,
 				Longitude:   lon,
 			}
@@ -343,6 +352,9 @@ func (cdm *ConsumerDeviceMatcher) processConsumerFile(fpath string) ([]ConsumerD
 				ZipCode:     consumer.ZipCode,
 				POI:         device.Address,
 				Campaign:    device.Campaign,
+				CampaignID:  device.CampaignID,
+				POIID:       device.POIID,
+				Phone:       consumer.TenDigitPhone,
 			}
 
 			matches = append(matches, match)

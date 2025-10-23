@@ -1644,13 +1644,7 @@ func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	dates := []string{
-		"2025-10-21",
-		"2025-10-20",
-		"2025-10-19",
-		"2025-10-18",
-		"2025-10-17",
-		"2025-10-16",
-		"2025-10-15",
+		"2025-10-22",
 	}
 
 	folderList := make([]string, 0, len(dates))
