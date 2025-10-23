@@ -1713,7 +1713,7 @@ func RunDeviceTracker(runSteps []int) error {
 	}
 
 	if step4 {
-		yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+		yesterday := time.Now().AddDate(0, 0, -1).Format("20060102")
 
 		consumerFolder := filepath.Join(outputFolder, "consumers")
 		idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", yesterday))
