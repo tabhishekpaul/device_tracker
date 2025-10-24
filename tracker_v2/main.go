@@ -1730,13 +1730,11 @@ func GetLastNDatesFromYesterday(n int) []string {
 func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	/*yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
 	ydates := []string{
 		yesterday,
-	}*/
-
-	ydates := GetLastNDatesFromYesterday(7)
+	}
 
 	yfolderList := make([]string, 0, len(ydates))
 	for _, d := range ydates {
@@ -1801,15 +1799,27 @@ func RunDeviceTracker(runSteps []int) error {
 	}
 
 	if step4 {
-		yesterday := "20251021" //ime.Now().AddDate(0, 0, -1).Format("20060102")
+		mdates := []string{
+			"20251022",
+			"20251020",
+			"20251019",
+			"20251018",
+			"20251017",
+			"20251016",
+			"20251015",
+		}
 
-		consumerFolder := filepath.Join(outputFolder, "consumers")
-		idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", yesterday))
+		for _, yesterday := range mdates {
+			//yesterday := "20251020" //ime.Now().AddDate(0, 0, -1).Format("20060102")
 
-		matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, yesterday)
+			consumerFolder := filepath.Join(outputFolder, "consumers")
+			idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", yesterday))
 
-		if err := matcher.Run(); err != nil {
-			log.Fatalf("Error: %v", err)
+			matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, yesterday)
+
+			if err := matcher.Run(); err != nil {
+				log.Fatalf("Error: %v", err)
+			}
 		}
 
 	}
