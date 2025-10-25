@@ -1799,27 +1799,15 @@ func RunDeviceTracker(runSteps []int) error {
 	}
 
 	if step4 {
-		mdates := []string{
-			"20251022",
-			"20251020",
-			"20251019",
-			"20251018",
-			"20251017",
-			"20251016",
-			"20251015",
-		}
+		yesterday := time.Now().AddDate(0, 0, -1).Format("20060102")
 
-		for _, yesterday := range mdates {
-			//yesterday := "20251020" //ime.Now().AddDate(0, 0, -1).Format("20060102")
+		consumerFolder := filepath.Join(outputFolder, "consumers")
+		idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", yesterday))
 
-			consumerFolder := filepath.Join(outputFolder, "consumers")
-			idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", yesterday))
+		matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, yesterday)
 
-			matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, yesterday)
-
-			if err := matcher.Run(); err != nil {
-				log.Fatalf("Error: %v", err)
-			}
+		if err := matcher.Run(); err != nil {
+			log.Fatalf("Error: %v", err)
 		}
 
 	}
@@ -1847,7 +1835,7 @@ func main() {
 
 	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
 	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{4} // Re-run to create proper files
+	runSteps := []int{1, 2, 3, 4} // Re-run to create proper files
 
 	err := RunDeviceTracker(runSteps)
 	if err != nil {
