@@ -1730,7 +1730,7 @@ func GetLastNDatesFromYesterday(n int) []string {
 func RunDeviceTracker(runSteps []int) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	yesterday := "2025-10-24" //time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
 	ydates := []string{
 		yesterday,
@@ -1799,7 +1799,7 @@ func RunDeviceTracker(runSteps []int) error {
 	}
 
 	if step4 {
-		yesterday := "20251024" //time.Now().AddDate(0, 0, -1).Format("20060102")
+		yesterday := time.Now().AddDate(0, 0, -1).Format("20060102")
 
 		consumerFolder := filepath.Join(outputFolder, "consumers")
 		idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", yesterday))
