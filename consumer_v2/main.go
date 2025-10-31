@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	MaxOutputFiles  = 300
-	RecordsPerBatch = 50000
+	MaxOutputFiles  = 500
+	RecordsPerBatch = 700000
 	BufferedRecords = 1000000
 )
 
