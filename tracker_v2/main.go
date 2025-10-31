@@ -1034,7 +1034,7 @@ func (dt *DeviceTracker) RunIdleDeviceSearch(folderList []string, targetDates []
 		runtime.GC()
 	}
 
-	dt.MergeIdleDevicesByEventDate()
+	//dt.MergeIdleDevicesByEventDate()
 	return nil
 }
 
