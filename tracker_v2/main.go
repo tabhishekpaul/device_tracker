@@ -113,7 +113,7 @@ const (
 	parquetBatchSize = 1000000
 	workerPoolSize   = 48
 	rowGroupWorkers  = 48
-	fileWorkers      = 16
+	fileWorkers      = 48
 	step3Workers     = 48
 )
 
