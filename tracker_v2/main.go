@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +31,90 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
+
+// ============================================================================
+// CONFIGURATION BLOCK
+// You can modify defaults below, or override them using CLI arguments.
+//
+// Example usage:
+//   go run main.go --steps=1,3,4 --dates=2025-10-30,2025-10-29
+//
+// When using Supervisor (or any process manager):
+//   [program:data_worker]
+//   command=/usr/local/bin/data_worker --steps=1,2 --dates=2025-10-30
+//   autostart=true
+//   autorestart=true
+//   stderr_logfile=/var/log/data_worker.err.log
+//   stdout_logfile=/var/log/data_worker.out.log
+// ============================================================================
+
+// Step identifiers (useful for readability instead of raw numbers)
+const (
+	StepDevicesInCampaign = 1 // Fetch devices within active campaigns
+	StepTimeFiltered      = 2 // Process data within a specific time range
+	StepIdleDevices       = 3 // Identify inactive devices
+	StepConsumerMatches   = 4 // Match consumer data across datasets
+)
+
+func main() {
+
+	startTime := time.Now()
+
+	// -------------------------------
+	// Default Configuration
+	// -------------------------------
+	defaultSteps := "1,2,3,4"
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	defaultDates := yesterday
+
+	// -------------------------------
+	// CLI Arguments
+	// -------------------------------
+	stepsFlag := flag.String("steps", defaultSteps,
+		"Comma-separated list of step numbers to run. (e.g. 1,3,4)")
+	datesFlag := flag.String("dates", defaultDates,
+		"Comma-separated list of dates in YYYY-MM-DD format. (e.g. 2025-10-30,2025-10-29)")
+
+	flag.Parse()
+
+	// -------------------------------
+	// Parse Steps
+	// -------------------------------
+	var runSteps []int
+	for _, s := range strings.Split(*stepsFlag, ",") {
+		switch strings.TrimSpace(s) {
+		case "1":
+			runSteps = append(runSteps, StepDevicesInCampaign)
+		case "2":
+			runSteps = append(runSteps, StepTimeFiltered)
+		case "3":
+			runSteps = append(runSteps, StepIdleDevices)
+		case "4":
+			runSteps = append(runSteps, StepConsumerMatches)
+		default:
+			fmt.Printf("⚠️  Unknown step '%s' ignored.\n", s)
+		}
+	}
+
+	// -------------------------------
+	// Parse Dates
+	// -------------------------------
+	var dates []string
+	for _, d := range strings.Split(*datesFlag, ",") {
+		dates = append(dates, strings.TrimSpace(d))
+	}
+
+	err := RunDeviceTracker(runSteps, dates)
+	if err != nil {
+		fmt.Printf("\n❌ Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	duration := time.Since(startTime)
+	fmt.Printf("\n╔═══════════════════════════════════════════════════════╗\n")
+	fmt.Printf("║ ✅ COMPLETED IN %v\n", duration)
+	fmt.Printf("╚═══════════════════════════════════════════════════════╝\n")
+}
 
 const (
 	parquetBatchSize = 1000000
@@ -1714,35 +1799,45 @@ func (dt *DeviceTracker) extractDateFromPath(path string) string {
 	return ""
 }
 
+// GetLastNDates returns the last `n` dates ending with the specified `endDate`,
+// formatted as "YYYY-MM-DD". The result is in ascending order (oldest → newest).
+//
+// Example:
+//
+//	endDate := "2025-10-30"
+//	GetLastNDates(endDate, 3)
+//	→ []string{"2025-10-28", "2025-10-29", "2025-10-30"}
+//
+// If the provided date string is invalid, it returns an empty slice.
+func GetLastNDates(endDate string, n int) []string {
+	end, err := time.Parse("2006-01-02", endDate)
+	if err != nil {
+		return []string{}
+	}
+
+	dates := make([]string, 0, n)
+	for i := n - 1; i >= 0; i-- {
+		date := end.AddDate(0, 0, -i)
+		dates = append(dates, date.Format("2006-01-02"))
+	}
+
+	return dates
+}
+
 // ============================================================================
 // MAIN
 // ============================================================================
 
-func GetLastNDatesFromYesterday(n int) []string {
-	dates := make([]string, n)
-	for i := 0; i < n; i++ {
-		date := time.Now().AddDate(0, 0, -(i + 1))
-		dates[i] = date.Format("2006-01-02")
-	}
-	return dates
-}
-
-func RunDeviceTracker(runSteps []int) error {
+func RunDeviceTracker(runSteps []int, dates []string) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-
-	ydates := []string{
-		yesterday,
-	}
-
-	yfolderList := make([]string, 0, len(ydates))
-	for _, d := range ydates {
+	yfolderList := make([]string, 0, len(dates))
+	for _, d := range dates {
 		folder := "load_date=" + strings.ReplaceAll(d, "-", "")
 		yfolderList = append(yfolderList, folder)
 	}
 
-	fmt.Printf("📅 Dates: %v\n", ydates)
+	fmt.Printf("📅 Dates: %v\n", dates)
 
 	mongoConfig := MongoConfig{
 		URI:        "mongodb://admin:nyros%4006@localhost:27017",
@@ -1783,31 +1878,38 @@ func RunDeviceTracker(runSteps []int) error {
 		}
 	}
 
-	dates := GetLastNDatesFromYesterday(7)
+	folderList := []string{}
 
-	folderList := make([]string, 0, len(dates))
 	for _, d := range dates {
-		folder := "load_date=" + strings.ReplaceAll(d, "-", "")
-		folderList = append(folderList, folder)
-	}
 
-	if step3 {
-		err := dt.RunIdleDeviceSearch(folderList, dates)
-		if err != nil {
-			log.Fatal(err)
+		lastNDates := GetLastNDates(d, 7)
+
+		lastNDates = append(lastNDates, d)
+
+		for _, d := range lastNDates {
+			folder := "load_date=" + strings.ReplaceAll(d, "-", "")
+			folderList = append(folderList, folder)
+		}
+
+		if step3 {
+			err := dt.RunIdleDeviceSearch(folderList, lastNDates)
+			if err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
 
 	if step4 {
-		yesterday := time.Now().AddDate(0, 0, -1).Format("20060102")
+		for _, date := range dates {
 
-		consumerFolder := filepath.Join(outputFolder, "consumers")
-		idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", yesterday))
+			consumerFolder := filepath.Join(outputFolder, "consumers")
+			idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", strings.ReplaceAll(date, "-", "")))
 
-		matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, yesterday)
+			matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, strings.ReplaceAll(date, "-", ""))
 
-		if err := matcher.Run(); err != nil {
-			log.Fatalf("Error: %v", err)
+			if err := matcher.Run(); err != nil {
+				log.Fatalf("Error: %v", err)
+			}
 		}
 
 	}
@@ -1822,29 +1924,4 @@ func containsStep(steps []int, step int) bool {
 		}
 	}
 	return false
-}
-
-func main() {
-	fmt.Println("╔═══════════════════════════════════════════════════════╗")
-	fmt.Println("║     DEVICE TRACKER - HYPER-PARALLEL EDITION          ║")
-	fmt.Println("║     48 CORES | 386GB RAM | 2000%+ CPU TARGET         ║")
-	fmt.Println("║     FIXED: Proper Parquet String Writing            ║")
-	fmt.Println("╚═══════════════════════════════════════════════════════╝")
-
-	startTime := time.Now()
-
-	// CRITICAL: Delete old time_filtered files and re-run Steps 1 & 2
-	// The existing files have NULL device_ids and cannot be fixed
-	runSteps := []int{1, 2, 3, 4} // Re-run to create proper files
-
-	err := RunDeviceTracker(runSteps)
-	if err != nil {
-		fmt.Printf("\n❌ Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	duration := time.Since(startTime)
-	fmt.Printf("\n╔═══════════════════════════════════════════════════════╗\n")
-	fmt.Printf("║ ✅ COMPLETED IN %v\n", duration)
-	fmt.Printf("╚═══════════════════════════════════════════════════════╝\n")
 }
