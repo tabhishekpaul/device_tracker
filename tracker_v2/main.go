@@ -1877,8 +1877,6 @@ func RunDeviceTracker(runSteps []int, dates []string) error {
 
 		lastNDates := GetLastNDates(d, 7)
 
-		lastNDates = append(lastNDates, d)
-
 		for _, d := range lastNDates {
 			folder := "load_date=" + strings.ReplaceAll(d, "-", "")
 			folderList = append(folderList, folder)
