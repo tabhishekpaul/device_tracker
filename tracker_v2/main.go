@@ -1034,7 +1034,7 @@ func (dt *DeviceTracker) RunIdleDeviceSearch(folderList []string, targetDates []
 		runtime.GC()
 	}
 
-	//dt.MergeIdleDevicesByEventDate()
+	dt.MergeIdleDevicesByEventDate()
 	return nil
 }
 
@@ -1882,7 +1882,6 @@ func RunDeviceTracker(runSteps []int, dates []string) error {
 			folderList = append(folderList, folder)
 		}
 
-		fmt.Println(folderList)
 		if step3 {
 			err := dt.RunIdleDeviceSearch(folderList, lastNDates)
 			if err != nil {
