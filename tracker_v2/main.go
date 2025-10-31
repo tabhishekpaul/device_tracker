@@ -37,7 +37,7 @@ import (
 // You can modify defaults below, or override them using CLI arguments.
 //
 // Example usage:
-//   go run main.go --steps=1,3,4 --dates=2025-10-30,2025-10-29
+//   go run . --steps=1,3,4 --dates=2025-10-30,2025-10-29
 //
 // When using Supervisor (or any process manager):
 //   [program:data_worker]
