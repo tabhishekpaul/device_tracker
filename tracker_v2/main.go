@@ -39,13 +39,6 @@ import (
 // Example usage:
 //   go run . --steps=1,3,4 --dates=2025-10-30,2025-10-29
 //
-// When using Supervisor (or any process manager):
-//   [program:data_worker]
-//   command=/usr/local/bin/data_worker --steps=1,2 --dates=2025-10-30
-//   autostart=true
-//   autorestart=true
-//   stderr_logfile=/var/log/data_worker.err.log
-//   stdout_logfile=/var/log/data_worker.out.log
 // ============================================================================
 
 // Step identifiers (useful for readability instead of raw numbers)
