@@ -21,11 +21,7 @@ import (
 	"github.com/paulmach/orb/geo"
 )
 
-const (
-	MatchRadiusMeters = 30.0
-	ParallelWorkers   = 48
-	GridSize          = 0.001
-)
+
 
 type ConsumerRecord struct {
 	ID              uint64

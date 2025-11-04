@@ -49,9 +49,39 @@ const (
 	StepConsumerMatches   = 4 // Match consumer data across datasets
 )
 
+var (
+	parquetBatchSize = 1000000 // Keep this fixed as it's data-related, not CPU-related
+	workerPoolSize   int
+	rowGroupWorkers  int
+	fileWorkers      int
+	step3Workers     int
+
+	//Consumer Matching Parameters
+	MatchRadiusMeters = 30.0
+	ParallelWorkers   int
+	GridSize          = 0.001
+)
+
 func main() {
 
 	startTime := time.Now()
+
+	numCPU := runtime.NumCPU()
+
+	// Set workers based on CPU cores with different multipliers
+	// You can adjust these multipliers based on your workload characteristics
+	workerPoolSize = numCPU * 3  // 3x CPU cores for general worker pool
+	rowGroupWorkers = numCPU * 3 // 3x CPU cores for row group processing
+	fileWorkers = numCPU * 3     // 3x CPU cores for file operations
+	step3Workers = numCPU * 3    // 3x CPU cores for step 3 processing
+	ParallelWorkers = numCPU * 3 // 3x CPU cores for consumer matching
+
+	// Optional: Set maximum limits to prevent resource exhaustion
+	workerPoolSize = min(workerPoolSize, 96)
+	rowGroupWorkers = min(rowGroupWorkers, 96)
+	fileWorkers = min(fileWorkers, 96)
+	step3Workers = min(step3Workers, 96)
+	ParallelWorkers = min(ParallelWorkers, 96)
 
 	// -------------------------------
 	// Default Configuration
@@ -108,14 +138,6 @@ func main() {
 	fmt.Printf("║ ✅ COMPLETED IN %v\n", duration)
 	fmt.Printf("╚═══════════════════════════════════════════════════════╝\n")
 }
-
-const (
-	parquetBatchSize = 1000000
-	workerPoolSize   = 48
-	rowGroupWorkers  = 48
-	fileWorkers      = 48
-	step3Workers     = 48
-)
 
 type MongoConfig struct {
 	URI        string
@@ -1817,6 +1839,15 @@ func GetLastNDates(endDate string, n int) []string {
 	return dates
 }
 
+func GetLastNDatesFromYesterday(n int) []string {
+	dates := make([]string, n)
+	for i := 0; i < n; i++ {
+		date := time.Now().AddDate(0, 0, -(i + 1))
+		dates[i] = date.Format("2006-01-02")
+	}
+	return dates
+}
+
 // ============================================================================
 // MAIN
 // ============================================================================
@@ -1871,22 +1902,18 @@ func RunDeviceTracker(runSteps []int, dates []string) error {
 		}
 	}
 
-	folderList := []string{}
+	ydates := GetLastNDatesFromYesterday(7)
 
+	folderList := make([]string, 0, len(ydates))
 	for _, d := range dates {
+		folder := "load_date=" + strings.ReplaceAll(d, "-", "")
+		folderList = append(folderList, folder)
+	}
 
-		lastNDates := GetLastNDates(d, 7)
-
-		for _, d := range lastNDates {
-			folder := "load_date=" + strings.ReplaceAll(d, "-", "")
-			folderList = append(folderList, folder)
-		}
-
-		if step3 {
-			err := dt.RunIdleDeviceSearch(folderList, lastNDates)
-			if err != nil {
-				log.Fatal(err)
-			}
+	if step3 {
+		err := dt.RunIdleDeviceSearch(folderList, dates)
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
 
