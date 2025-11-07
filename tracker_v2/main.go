@@ -334,6 +334,12 @@ type IdleDevicesByDate struct {
 	IdleDevices      []IdleDeviceResult `json:"idle_devices"`
 }
 
+type IdleDevicesByDates struct {
+	EventDates       []string           `json:"event_dates"`
+	TotalIdleDevices int                `json:"total_idle_devices"`
+	IdleDevices      []IdleDeviceResult `json:"idle_devices"`
+}
+
 type FinalIdleDevicesOutput struct {
 	ProcessedDates    []string                      `json:"processed_dates"`
 	TotalIdleDevices  int                           `json:"total_idle_devices"`
@@ -1526,9 +1532,8 @@ func (dt *DeviceTracker) MergeIdleDevicesByEventDate() error {
 		return nil
 	}
 
-	allIdleDevicesByDate := make(map[string][]IdleDeviceResult)
+	allIdleDevices := make([]IdleDeviceResult, 0)
 	processedDates := make([]string, 0)
-	totalDevices := 0
 
 	for _, filePath := range files {
 		fileName := filepath.Base(filePath)
@@ -1540,18 +1545,16 @@ func (dt *DeviceTracker) MergeIdleDevicesByEventDate() error {
 			continue
 		}
 
-		allIdleDevicesByDate[eventDate] = devices
+		allIdleDevices = append(allIdleDevices, devices...)
 		processedDates = append(processedDates, eventDate)
-		totalDevices += len(devices)
 	}
 
 	sort.Strings(processedDates)
 
-	finalOutput := FinalIdleDevicesOutput{
-		ProcessedDates:    processedDates,
-		TotalIdleDevices:  totalDevices,
-		ProcessingTimeMs:  0,
-		IdleDevicesByDate: allIdleDevicesByDate,
+	finalOutput := IdleDevicesByDates{
+		EventDates:       processedDates,
+		TotalIdleDevices: len(allIdleDevices),
+		IdleDevices:      allIdleDevices,
 	}
 
 	finalJSONPath := filepath.Join(dt.OutputFolder, "Idle_devices.json")
@@ -1565,7 +1568,7 @@ func (dt *DeviceTracker) MergeIdleDevicesByEventDate() error {
 	encoder.SetIndent("", "  ")
 	encoder.Encode(finalOutput)
 
-	fmt.Printf("\n💾 Final: %d idle devices across %d dates\n", totalDevices, len(processedDates))
+	fmt.Printf("\n💾 Final: %d idle devices across %d dates\n", len(allIdleDevices), len(processedDates))
 	return nil
 }
 
