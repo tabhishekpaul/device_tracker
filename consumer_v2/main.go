@@ -23,7 +23,7 @@ import (
 
 const (
 	MaxFileSizeMB  = 100
-	RecordsPerFile = 3000000 // Approximate records to reach ~100MB
+	RecordsPerFile = 3100000 // Approximate records to reach ~100MB
 )
 
 var NumWorkers = runtime.NumCPU() * 3
