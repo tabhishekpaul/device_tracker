@@ -70,11 +70,11 @@ func main() {
 
 	// Set workers based on CPU cores with different multipliers
 	// You can adjust these multipliers based on your workload characteristics
-	workerPoolSize = numCPU * 3  // 3x CPU cores for general worker pool
-	rowGroupWorkers = numCPU * 3 // 3x CPU cores for row group processing
-	fileWorkers = numCPU * 3     // 3x CPU cores for file operations
-	step3Workers = numCPU * 3    // 3x CPU cores for step 3 processing
-	ParallelWorkers = numCPU * 3 // 3x CPU cores for consumer matching
+	workerPoolSize = numCPU * 2  // 2x CPU cores for general worker pool
+	rowGroupWorkers = numCPU * 2 // 2x CPU cores for row group processing
+	fileWorkers = numCPU * 2     // 2x CPU cores for file operations
+	step3Workers = numCPU * 2    // 2x CPU cores for step 3 processing
+	ParallelWorkers = numCPU * 2 // 2x CPU cores for consumer matching
 
 	// Optional: Set maximum limits to prevent resource exhaustion
 	workerPoolSize = min(workerPoolSize, 96)
