@@ -149,6 +149,11 @@ func (sc *SimpleConverter) writeBufferedRecords() error {
 		return nil
 	}
 
+	// Make sure we have a writer
+	if sc.currentWriter == nil {
+		return fmt.Errorf("cannot write: writer is nil")
+	}
+
 	pool := memory.NewGoAllocator()
 
 	// Create builders
@@ -229,7 +234,7 @@ func (sc *SimpleConverter) writeBufferedRecords() error {
 }
 
 func (sc *SimpleConverter) checkAndRotateFile() error {
-	if sc.currentFile == nil {
+	if sc.currentWriter == nil || sc.currentFile == nil {
 		return nil
 	}
 
@@ -245,7 +250,7 @@ func (sc *SimpleConverter) checkAndRotateFile() error {
 		if err := sc.closeCurrentWriter(); err != nil {
 			return err
 		}
-		// Create new file
+		// Create new file immediately
 		if err := sc.createNewWriter(); err != nil {
 			return err
 		}
@@ -267,12 +272,17 @@ func (sc *SimpleConverter) addRecord(record ConsumerRecord) error {
 
 	// Write buffer when it reaches 10000 records
 	if len(sc.recordBuffer) >= 10000 {
+		// Make sure we still have a writer
+		if sc.currentWriter == nil {
+			return fmt.Errorf("writer is nil")
+		}
+
 		// Write the buffer
 		if err := sc.writeBufferedRecords(); err != nil {
 			return err
 		}
 
-		// Check if we need to rotate to a new file
+		// Check if we need to rotate to a new file (this may close and create new writer)
 		if err := sc.checkAndRotateFile(); err != nil {
 			return err
 		}
