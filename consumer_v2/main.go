@@ -7,7 +7,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow/go/v14/arrow"
@@ -20,8 +23,10 @@ import (
 
 const (
 	MaxFileSizeMB  = 100
-	RecordsPerFile = 3500000 // Approximate records to reach ~100MB
+	RecordsPerFile = 3000000 // Approximate records to reach ~100MB
 )
+
+var NumWorkers = runtime.NumCPU() * 3
 
 type ConsumerRecord struct {
 	ID              string
@@ -42,9 +47,9 @@ type SimpleConverter struct {
 	outputFolder string
 	logger       *log.Logger
 	schema       *arrow.Schema
-	fileCounter  int
-	totalRecords int64
-	skippedRows  int64
+	fileCounter  int32
+	totalRecords atomic.Int64
+	skippedRows  atomic.Int64
 	startTime    time.Time
 }
 
@@ -85,7 +90,8 @@ func (sc *SimpleConverter) writeRecordsToFile(records []ConsumerRecord) error {
 		return nil
 	}
 
-	fileName := fmt.Sprintf("consumers_chunk_%04d.parquet", sc.fileCounter)
+	fileNum := atomic.AddInt32(&sc.fileCounter, 1) - 1
+	fileName := fmt.Sprintf("consumers_chunk_%04d.parquet", fileNum)
 	filePath := filepath.Join(sc.outputFolder, fileName)
 
 	file, err := os.Create(filePath)
@@ -183,19 +189,19 @@ func (sc *SimpleConverter) writeRecordsToFile(records []ConsumerRecord) error {
 	}
 
 	sc.logger.Printf("✅ %s → %d records (%s)", fileName, len(records), formatSize(fileSize))
-	sc.fileCounter++
 
 	return nil
 }
 
 func (sc *SimpleConverter) Convert() error {
 	sc.logger.Println("╔═══════════════════════════════════════════════════════╗")
-	sc.logger.Println("║  CSV TO PARQUET - ONE WRITE PER FILE                 ║")
+	sc.logger.Println("║  CSV TO PARQUET - PARALLEL ONE WRITE PER FILE        ║")
 	sc.logger.Println("╚═══════════════════════════════════════════════════════╝")
 	sc.logger.Printf("Input:            %s", sc.csvPath)
 	sc.logger.Printf("Output:           %s", sc.outputFolder)
 	sc.logger.Printf("Target file size: %d MB", MaxFileSizeMB)
-	sc.logger.Printf("Records per file: ~%d\n", RecordsPerFile)
+	sc.logger.Printf("Records per file: ~%d", RecordsPerFile)
+	sc.logger.Printf("Workers:          %d (CPU cores: %d)\n", NumWorkers, runtime.NumCPU())
 
 	file, err := os.Open(sc.csvPath)
 	if err != nil {
@@ -231,63 +237,104 @@ func (sc *SimpleConverter) Convert() error {
 	sc.logger.Println("\n📦 Processing records...")
 	sc.startTime = time.Now()
 
-	// Buffer to accumulate records
-	recordBuffer := make([]ConsumerRecord, 0, RecordsPerFile)
-	lastUpdate := time.Now()
+	// Channels for parallel processing
+	rowChan := make(chan []string, NumWorkers*1000)
+	recordChan := make(chan ConsumerRecord, NumWorkers*1000)
 
+	var wg sync.WaitGroup
+
+	// Start parser workers
+	for i := 0; i < NumWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for row := range rowChan {
+				record, err := sc.parseRecord(row, colIndex)
+				if err != nil {
+					sc.skippedRows.Add(1)
+					continue
+				}
+				recordChan <- record
+			}
+		}(i)
+	}
+
+	// Collector goroutine - accumulates records and writes to file
+	collectorDone := make(chan error, 1)
+	go func() {
+		recordBuffer := make([]ConsumerRecord, 0, RecordsPerFile)
+		lastUpdate := time.Now()
+
+		for record := range recordChan {
+			recordBuffer = append(recordBuffer, record)
+			sc.totalRecords.Add(1)
+
+			// When buffer reaches target size, write to file
+			if len(recordBuffer) >= RecordsPerFile {
+				if err := sc.writeRecordsToFile(recordBuffer); err != nil {
+					collectorDone <- fmt.Errorf("failed to write file: %w", err)
+					return
+				}
+				// Clear buffer for next file
+				recordBuffer = recordBuffer[:0]
+			}
+
+			// Progress update every 5 seconds
+			if time.Since(lastUpdate) >= 5*time.Second {
+				elapsed := time.Since(sc.startTime)
+				rate := float64(sc.totalRecords.Load()) / elapsed.Seconds()
+				sc.logger.Printf("  ⚡ %.0f records/sec", rate)
+				lastUpdate = time.Now()
+			}
+		}
+
+		// Write remaining records
+		if len(recordBuffer) > 0 {
+			if err := sc.writeRecordsToFile(recordBuffer); err != nil {
+				collectorDone <- fmt.Errorf("failed to write final file: %w", err)
+				return
+			}
+		}
+
+		collectorDone <- nil
+	}()
+
+	// Read CSV and send to workers
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			sc.skippedRows++
+			sc.skippedRows.Add(1)
 			continue
 		}
 
-		record, err := sc.parseRecord(row, colIndex)
-		if err != nil {
-			sc.skippedRows++
-			continue
-		}
-
-		recordBuffer = append(recordBuffer, record)
-		sc.totalRecords++
-
-		// When buffer reaches target size, write to file
-		if len(recordBuffer) >= RecordsPerFile {
-			if err := sc.writeRecordsToFile(recordBuffer); err != nil {
-				return fmt.Errorf("failed to write file: %w", err)
-			}
-			// Clear buffer for next file
-			recordBuffer = recordBuffer[:0]
-		}
-
-		// Progress update every 5 seconds
-		if time.Since(lastUpdate) >= 5*time.Second {
-			elapsed := time.Since(sc.startTime)
-			rate := float64(sc.totalRecords) / elapsed.Seconds()
-			sc.logger.Printf("  ⚡ %.0f records/sec", rate)
-			lastUpdate = time.Now()
-		}
+		// Make a copy of the row since reader reuses it
+		rowCopy := make([]string, len(row))
+		copy(rowCopy, row)
+		rowChan <- rowCopy
 	}
 
-	// Write remaining records
-	if len(recordBuffer) > 0 {
-		if err := sc.writeRecordsToFile(recordBuffer); err != nil {
-			return fmt.Errorf("failed to write final file: %w", err)
-		}
+	// Shutdown sequence
+	close(rowChan)        // No more rows
+	wg.Wait()             // Wait for all parsers
+	close(recordChan)     // No more records
+	err = <-collectorDone // Wait for collector
+
+	if err != nil {
+		return err
 	}
 
 	elapsed := time.Since(sc.startTime)
-	avgRate := float64(sc.totalRecords) / elapsed.Seconds()
+	avgRate := float64(sc.totalRecords.Load()) / elapsed.Seconds()
 
 	sc.logger.Println("\n╔═══════════════════════════════════════════════════════╗")
 	sc.logger.Println("║  ✅ CONVERSION COMPLETE                               ║")
 	sc.logger.Println("╚═══════════════════════════════════════════════════════╝")
-	sc.logger.Printf("Total records:   %d", sc.totalRecords)
-	sc.logger.Printf("Skipped rows:    %d", sc.skippedRows)
-	sc.logger.Printf("Output files:    %d", sc.fileCounter)
+	sc.logger.Printf("Total records:   %d", sc.totalRecords.Load())
+	sc.logger.Printf("Skipped rows:    %d", sc.skippedRows.Load())
+	sc.logger.Printf("Output files:    %d", atomic.LoadInt32(&sc.fileCounter))
 	sc.logger.Printf("Time elapsed:    %v", elapsed)
 	sc.logger.Printf("Average rate:    %.0f records/sec", avgRate)
 	sc.logger.Printf("Output location: %s\n", sc.outputFolder)
