@@ -408,7 +408,7 @@ func (dt *DeviceTracker) parseTimeFilters() {
 	dt.startSeconds = dt.filterStartHour*3600 + dt.filterStartMin*60 + dt.filterStartSec
 	dt.endSeconds = dt.filterEndHour*3600 + dt.filterEndMin*60 + dt.filterEndSec
 
-	fmt.Printf("⚙️  Cores: %d | Workers: %d | RAM: 386GB\n", runtime.NumCPU(), workerPoolSize)
+	fmt.Printf("⚙️  Cores: %d | Workers: %d\n", runtime.NumCPU(), workerPoolSize)
 	fmt.Printf("⚙️  Time filter: %s to %s\n", dt.FilterInTime, dt.FilterOutTime)
 }
 
@@ -1921,7 +1921,7 @@ func RunDeviceTracker(runSteps []int, dates []string) error {
 		for _, date := range dates {
 
 			consumerFolder := filepath.Join(outputFolder, "consumers")
-			idleDevicesPath := filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", strings.ReplaceAll(date, "-", "")))
+			idleDevicesPath := filepath.Join(outputFolder, "Idle_devices.json")
 
 			matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, strings.ReplaceAll(date, "-", ""))
 
