@@ -7,7 +7,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow/go/v14/arrow"
@@ -22,6 +25,8 @@ const (
 	MaxFileSizeMB = 100 // Target max size for each parquet file
 	MaxFileSize   = MaxFileSizeMB * 1024 * 1024
 )
+
+var NumWorkers = runtime.NumCPU() * 3
 
 type ConsumerRecord struct {
 	ID              string
@@ -42,13 +47,16 @@ type SimpleConverter struct {
 	outputFolder  string
 	logger        *log.Logger
 	schema        *arrow.Schema
-	fileCounter   int
-	totalRecords  int64
-	skippedRows   int64
+	fileCounter   int32
+	totalRecords  atomic.Int64
+	skippedRows   atomic.Int64
 	startTime     time.Time
 	currentWriter *pqarrow.FileWriter
 	currentFile   *os.File
+	currentSize   int64
 	recordBuffer  []ConsumerRecord
+	mutex         sync.Mutex
+	writerMutex   sync.Mutex
 	recordsInFile int64
 }
 
@@ -81,12 +89,12 @@ func NewSimpleConverter(csvPath, outputFolder string) (*SimpleConverter, error) 
 		outputFolder: outputFolder,
 		logger:       logger,
 		schema:       schema,
-		recordBuffer: make([]ConsumerRecord, 0, 10000),
+		recordBuffer: make([]ConsumerRecord, 0),
 	}, nil
 }
 
 func (sc *SimpleConverter) createNewWriter() error {
-	fileName := fmt.Sprintf("consumers_chunk_%04d.parquet", sc.fileCounter)
+	fileName := fmt.Sprintf("consumers_chunk_%04d.parquet", atomic.LoadInt32(&sc.fileCounter))
 	filePath := filepath.Join(sc.outputFolder, fileName)
 
 	file, err := os.Create(filePath)
@@ -107,8 +115,9 @@ func (sc *SimpleConverter) createNewWriter() error {
 
 	sc.currentWriter = writer
 	sc.currentFile = file
+	sc.currentSize = 0
 	sc.recordsInFile = 0
-	sc.fileCounter++
+	atomic.AddInt32(&sc.fileCounter, 1)
 
 	sc.logger.Printf("📝 Created new file: %s", fileName)
 
@@ -119,6 +128,8 @@ func (sc *SimpleConverter) closeCurrentWriter() error {
 	if sc.currentWriter == nil {
 		return nil
 	}
+
+	// Don't flush here - buffer is already flushed before calling this
 
 	if err := sc.currentWriter.Close(); err != nil {
 		return err
@@ -147,11 +158,6 @@ func (sc *SimpleConverter) closeCurrentWriter() error {
 func (sc *SimpleConverter) writeBufferedRecords() error {
 	if len(sc.recordBuffer) == 0 {
 		return nil
-	}
-
-	// Make sure we have a writer
-	if sc.currentWriter == nil {
-		return fmt.Errorf("cannot write: writer is nil")
 	}
 
 	pool := memory.NewGoAllocator()
@@ -233,33 +239,31 @@ func (sc *SimpleConverter) writeBufferedRecords() error {
 	return nil
 }
 
-func (sc *SimpleConverter) checkAndRotateFile() error {
-	if sc.currentWriter == nil || sc.currentFile == nil {
-		return nil
+func (sc *SimpleConverter) checkFileSize() (bool, error) {
+	if sc.currentFile == nil {
+		return false, nil
 	}
 
 	// Get current file size
 	info, err := os.Stat(sc.currentFile.Name())
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	// If file exceeds max size, rotate to new file
-	if info.Size() >= MaxFileSize {
-		// Close current file
-		if err := sc.closeCurrentWriter(); err != nil {
-			return err
-		}
-		// Create new file immediately
-		if err := sc.createNewWriter(); err != nil {
-			return err
-		}
+	sc.currentSize = info.Size()
+
+	// Return true if file exceeds max size
+	if sc.currentSize >= MaxFileSize {
+		return true, nil
 	}
 
-	return nil
+	return false, nil
 }
 
 func (sc *SimpleConverter) addRecord(record ConsumerRecord) error {
+	sc.writerMutex.Lock()
+	defer sc.writerMutex.Unlock()
+
 	// Create first writer if needed
 	if sc.currentWriter == nil {
 		if err := sc.createNewWriter(); err != nil {
@@ -270,21 +274,29 @@ func (sc *SimpleConverter) addRecord(record ConsumerRecord) error {
 	// Add to buffer
 	sc.recordBuffer = append(sc.recordBuffer, record)
 
-	// Write buffer when it reaches 10000 records
+	// Write buffer periodically (every 10000 records) to check file size
 	if len(sc.recordBuffer) >= 10000 {
-		// Make sure we still have a writer
-		if sc.currentWriter == nil {
-			return fmt.Errorf("writer is nil")
-		}
-
-		// Write the buffer
+		// First, write the buffer
 		if err := sc.writeBufferedRecords(); err != nil {
 			return err
 		}
 
-		// Check if we need to rotate to a new file (this may close and create new writer)
-		if err := sc.checkAndRotateFile(); err != nil {
+		// Then check if file size exceeded
+		needNewFile, err := sc.checkFileSize()
+		if err != nil {
 			return err
+		}
+
+		// If we need a new file, close current and create new one
+		if needNewFile && sc.currentWriter != nil {
+			// Close the current writer
+			if err := sc.closeCurrentWriter(); err != nil {
+				return err
+			}
+			// Create new writer
+			if err := sc.createNewWriter(); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -293,11 +305,12 @@ func (sc *SimpleConverter) addRecord(record ConsumerRecord) error {
 
 func (sc *SimpleConverter) Convert() error {
 	sc.logger.Println("╔═══════════════════════════════════════════════════════╗")
-	sc.logger.Println("║  CSV TO PARQUET - SINGLE THREADED CONVERTER          ║")
+	sc.logger.Println("║  CSV TO PARQUET - PARALLEL CONVERTER                 ║")
 	sc.logger.Println("╚═══════════════════════════════════════════════════════╝")
 	sc.logger.Printf("Input:         %s", sc.csvPath)
 	sc.logger.Printf("Output:        %s", sc.outputFolder)
-	sc.logger.Printf("Max file size: %d MB\n", MaxFileSizeMB)
+	sc.logger.Printf("Max file size: %d MB", MaxFileSizeMB)
+	sc.logger.Printf("Workers:       %d (CPU cores: %d)\n", NumWorkers, runtime.NumCPU())
 
 	file, err := os.Open(sc.csvPath)
 	if err != nil {
@@ -333,60 +346,106 @@ func (sc *SimpleConverter) Convert() error {
 	sc.logger.Println("\n📦 Processing records...")
 	sc.startTime = time.Now()
 
-	lastUpdate := time.Now()
+	// Channel for raw CSV rows
+	rowChan := make(chan []string, NumWorkers*1000)
+	// Channel for parsed records
+	recordChan := make(chan ConsumerRecord, NumWorkers*1000)
 
+	var wg sync.WaitGroup
+
+	// Start parser workers
+	for i := 0; i < NumWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for row := range rowChan {
+				record, err := sc.parseRecord(row, colIndex)
+				if err != nil {
+					sc.skippedRows.Add(1)
+					continue
+				}
+				recordChan <- record
+			}
+		}(i)
+	}
+
+	// Start writer goroutine
+	writerDone := make(chan error, 1)
+	go func() {
+		for record := range recordChan {
+			if err := sc.addRecord(record); err != nil {
+				sc.logger.Printf("Error adding record: %v", err)
+				continue
+			}
+			sc.totalRecords.Add(1)
+		}
+		writerDone <- nil
+	}()
+
+	// Progress reporter
+	stopProgress := make(chan bool)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(sc.startTime)
+				rate := float64(sc.totalRecords.Load()) / elapsed.Seconds()
+				sc.logger.Printf("  ⚡ %.0f records/sec", rate)
+			case <-stopProgress:
+				return
+			}
+		}
+	}()
+
+	// Read CSV and send to workers
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			sc.skippedRows++
+			sc.skippedRows.Add(1)
 			continue
 		}
 
-		record, err := sc.parseRecord(row, colIndex)
-		if err != nil {
-			sc.skippedRows++
-			continue
-		}
-
-		if err := sc.addRecord(record); err != nil {
-			return fmt.Errorf("error adding record: %w", err)
-		}
-
-		sc.totalRecords++
-
-		// Progress update every 5 seconds
-		if time.Since(lastUpdate) >= 5*time.Second {
-			elapsed := time.Since(sc.startTime)
-			rate := float64(sc.totalRecords) / elapsed.Seconds()
-			sc.logger.Printf("  ⚡ %.0f records/sec", rate)
-			lastUpdate = time.Now()
-		}
+		// Make a copy of the row since reader reuses it
+		rowCopy := make([]string, len(row))
+		copy(rowCopy, row)
+		rowChan <- rowCopy
 	}
 
-	// Flush any remaining records
+	// Shutdown sequence
+	close(rowChan)       // No more rows
+	wg.Wait()            // Wait for all parsers
+	close(recordChan)    // No more records
+	<-writerDone         // Wait for writer
+	stopProgress <- true // Stop progress reporter
+
+	// Close final writer (flush any remaining records)
+	sc.writerMutex.Lock()
 	if len(sc.recordBuffer) > 0 {
 		if err := sc.writeBufferedRecords(); err != nil {
+			sc.writerMutex.Unlock()
 			return err
 		}
 	}
-
-	// Close final writer
 	if err := sc.closeCurrentWriter(); err != nil {
+		sc.writerMutex.Unlock()
 		return err
 	}
+	sc.writerMutex.Unlock()
 
 	elapsed := time.Since(sc.startTime)
-	avgRate := float64(sc.totalRecords) / elapsed.Seconds()
+	avgRate := float64(sc.totalRecords.Load()) / elapsed.Seconds()
 
 	sc.logger.Println("\n╔═══════════════════════════════════════════════════════╗")
 	sc.logger.Println("║  ✅ CONVERSION COMPLETE                               ║")
 	sc.logger.Println("╚═══════════════════════════════════════════════════════╝")
-	sc.logger.Printf("Total records:   %d", sc.totalRecords)
-	sc.logger.Printf("Skipped rows:    %d", sc.skippedRows)
-	sc.logger.Printf("Output files:    %d", sc.fileCounter)
+	sc.logger.Printf("Total records:   %d", sc.totalRecords.Load())
+	sc.logger.Printf("Skipped rows:    %d", sc.skippedRows.Load())
+	sc.logger.Printf("Output files:    %d", atomic.LoadInt32(&sc.fileCounter))
 	sc.logger.Printf("Time elapsed:    %v", elapsed)
 	sc.logger.Printf("Average rate:    %.0f records/sec", avgRate)
 	sc.logger.Printf("Output location: %s\n", sc.outputFolder)
