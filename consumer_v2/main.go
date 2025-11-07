@@ -129,12 +129,7 @@ func (sc *SimpleConverter) closeCurrentWriter() error {
 		return nil
 	}
 
-	// Flush any remaining records
-	if len(sc.recordBuffer) > 0 {
-		if err := sc.writeBufferedRecords(); err != nil {
-			return err
-		}
-	}
+	// Don't flush here - buffer is already flushed before calling this
 
 	if err := sc.currentWriter.Close(); err != nil {
 		return err
@@ -257,11 +252,8 @@ func (sc *SimpleConverter) checkFileSize() (bool, error) {
 
 	sc.currentSize = info.Size()
 
-	// If file exceeds max size, close and return true
+	// Return true if file exceeds max size
 	if sc.currentSize >= MaxFileSize {
-		if err := sc.closeCurrentWriter(); err != nil {
-			return false, err
-		}
 		return true, nil
 	}
 
@@ -284,18 +276,24 @@ func (sc *SimpleConverter) addRecord(record ConsumerRecord) error {
 
 	// Write buffer periodically (every 10000 records) to check file size
 	if len(sc.recordBuffer) >= 10000 {
+		// First, write the buffer
 		if err := sc.writeBufferedRecords(); err != nil {
 			return err
 		}
 
-		// Check if file size exceeded
+		// Then check if file size exceeded
 		needNewFile, err := sc.checkFileSize()
 		if err != nil {
 			return err
 		}
 
-		// If we need a new file, create it
-		if needNewFile {
+		// If we need a new file, close current and create new one
+		if needNewFile && sc.currentWriter != nil {
+			// Close the current writer
+			if err := sc.closeCurrentWriter(); err != nil {
+				return err
+			}
+			// Create new writer
 			if err := sc.createNewWriter(); err != nil {
 				return err
 			}
@@ -425,8 +423,14 @@ func (sc *SimpleConverter) Convert() error {
 	<-writerDone         // Wait for writer
 	stopProgress <- true // Stop progress reporter
 
-	// Close final writer
+	// Close final writer (flush any remaining records)
 	sc.writerMutex.Lock()
+	if len(sc.recordBuffer) > 0 {
+		if err := sc.writeBufferedRecords(); err != nil {
+			sc.writerMutex.Unlock()
+			return err
+		}
+	}
 	if err := sc.closeCurrentWriter(); err != nil {
 		sc.writerMutex.Unlock()
 		return err
