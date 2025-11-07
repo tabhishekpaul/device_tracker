@@ -20,7 +20,7 @@ import (
 
 const (
 	MaxFileSizeMB  = 100
-	RecordsPerFile = 700000 // Approximate records to reach ~100MB
+	RecordsPerFile = 3500000 // Approximate records to reach ~100MB
 )
 
 type ConsumerRecord struct {
