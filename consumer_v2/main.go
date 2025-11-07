@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	MaxFileSizeMB = 100 // Target max size for each parquet file
-	MaxFileSize   = MaxFileSizeMB * 1024 * 1024
+	MaxFileSizeMB  = 100
+	RecordsPerFile = 700000 // Approximate records to reach ~100MB
 )
 
 type ConsumerRecord struct {
@@ -38,18 +38,14 @@ type ConsumerRecord struct {
 }
 
 type SimpleConverter struct {
-	csvPath       string
-	outputFolder  string
-	logger        *log.Logger
-	schema        *arrow.Schema
-	fileCounter   int
-	totalRecords  int64
-	skippedRows   int64
-	startTime     time.Time
-	currentWriter *pqarrow.FileWriter
-	currentFile   *os.File
-	recordBuffer  []ConsumerRecord
-	recordsInFile int64
+	csvPath      string
+	outputFolder string
+	logger       *log.Logger
+	schema       *arrow.Schema
+	fileCounter  int
+	totalRecords int64
+	skippedRows  int64
+	startTime    time.Time
 }
 
 func NewSimpleConverter(csvPath, outputFolder string) (*SimpleConverter, error) {
@@ -81,11 +77,14 @@ func NewSimpleConverter(csvPath, outputFolder string) (*SimpleConverter, error) 
 		outputFolder: outputFolder,
 		logger:       logger,
 		schema:       schema,
-		recordBuffer: make([]ConsumerRecord, 0, 10000),
 	}, nil
 }
 
-func (sc *SimpleConverter) createNewWriter() error {
+func (sc *SimpleConverter) writeRecordsToFile(records []ConsumerRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
 	fileName := fmt.Sprintf("consumers_chunk_%04d.parquet", sc.fileCounter)
 	filePath := filepath.Join(sc.outputFolder, fileName)
 
@@ -93,6 +92,7 @@ func (sc *SimpleConverter) createNewWriter() error {
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
+	defer file.Close()
 
 	props := parquet.NewWriterProperties(
 		parquet.WithCompression(compress.Codecs.Snappy),
@@ -101,58 +101,9 @@ func (sc *SimpleConverter) createNewWriter() error {
 
 	writer, err := pqarrow.NewFileWriter(sc.schema, file, props, pqarrow.DefaultWriterProps())
 	if err != nil {
-		file.Close()
 		return fmt.Errorf("failed to create writer: %w", err)
 	}
-
-	sc.currentWriter = writer
-	sc.currentFile = file
-	sc.recordsInFile = 0
-	sc.fileCounter++
-
-	sc.logger.Printf("📝 Created new file: %s", fileName)
-
-	return nil
-}
-
-func (sc *SimpleConverter) closeCurrentWriter() error {
-	if sc.currentWriter == nil {
-		return nil
-	}
-
-	if err := sc.currentWriter.Close(); err != nil {
-		return err
-	}
-
-	filePath := sc.currentFile.Name()
-
-	if err := sc.currentFile.Close(); err != nil {
-		return err
-	}
-
-	// Get final file size
-	info, err := os.Stat(filePath)
-	if err == nil {
-		sc.logger.Printf("✅ %s → %d records (%s)",
-			filepath.Base(filePath), sc.recordsInFile, formatSize(info.Size()))
-	}
-
-	sc.currentWriter = nil
-	sc.currentFile = nil
-	sc.recordsInFile = 0
-
-	return nil
-}
-
-func (sc *SimpleConverter) writeBufferedRecords() error {
-	if len(sc.recordBuffer) == 0 {
-		return nil
-	}
-
-	// Make sure we have a writer
-	if sc.currentWriter == nil {
-		return fmt.Errorf("cannot write: writer is nil")
-	}
+	defer writer.Close()
 
 	pool := memory.NewGoAllocator()
 
@@ -170,8 +121,8 @@ func (sc *SimpleConverter) writeBufferedRecords() error {
 	zipBuilder := array.NewStringBuilder(pool)
 
 	// Append all records
-	for i := range sc.recordBuffer {
-		rec := &sc.recordBuffer[i]
+	for i := range records {
+		rec := &records[i]
 		idBuilder.Append(rec.ID)
 		latBuilder.Append(rec.Latitude)
 		lonBuilder.Append(rec.Longitude)
@@ -215,89 +166,36 @@ func (sc *SimpleConverter) writeBufferedRecords() error {
 		sc.schema,
 		[]arrow.Array{idArray, latArray, lonArray, firstNameArray, lastNameArray,
 			addressArray, phoneArray, emailArray, cityArray, stateArray, zipArray},
-		int64(len(sc.recordBuffer)),
+		int64(len(records)),
 	)
 	defer record.Release()
 
-	// Write to file
-	if err := sc.currentWriter.Write(record); err != nil {
+	// Write to file (ONLY ONCE!)
+	if err := writer.Write(record); err != nil {
 		return fmt.Errorf("write error: %w", err)
 	}
 
-	// Track records added to this file
-	sc.recordsInFile += int64(len(sc.recordBuffer))
-
-	// Clear buffer
-	sc.recordBuffer = sc.recordBuffer[:0]
-
-	return nil
-}
-
-func (sc *SimpleConverter) checkAndRotateFile() error {
-	if sc.currentWriter == nil || sc.currentFile == nil {
-		return nil
+	// Get file size
+	info, err := os.Stat(filePath)
+	var fileSize int64
+	if err == nil {
+		fileSize = info.Size()
 	}
 
-	// Get current file size
-	info, err := os.Stat(sc.currentFile.Name())
-	if err != nil {
-		return err
-	}
-
-	// If file exceeds max size, rotate to new file
-	if info.Size() >= MaxFileSize {
-		// Close current file
-		if err := sc.closeCurrentWriter(); err != nil {
-			return err
-		}
-		// Create new file immediately
-		if err := sc.createNewWriter(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (sc *SimpleConverter) addRecord(record ConsumerRecord) error {
-	// Create first writer if needed
-	if sc.currentWriter == nil {
-		if err := sc.createNewWriter(); err != nil {
-			return err
-		}
-	}
-
-	// Add to buffer
-	sc.recordBuffer = append(sc.recordBuffer, record)
-
-	// Write buffer when it reaches 10000 records
-	if len(sc.recordBuffer) >= 10000 {
-		// Make sure we still have a writer
-		if sc.currentWriter == nil {
-			return fmt.Errorf("writer is nil")
-		}
-
-		// Write the buffer
-		if err := sc.writeBufferedRecords(); err != nil {
-			return err
-		}
-
-		// Check if we need to rotate to a new file (this may close and create new writer)
-		if err := sc.checkAndRotateFile(); err != nil {
-			return err
-		}
-	}
+	sc.logger.Printf("✅ %s → %d records (%s)", fileName, len(records), formatSize(fileSize))
+	sc.fileCounter++
 
 	return nil
 }
 
 func (sc *SimpleConverter) Convert() error {
 	sc.logger.Println("╔═══════════════════════════════════════════════════════╗")
-	sc.logger.Println("║  CSV TO PARQUET - SINGLE THREADED CONVERTER          ║")
+	sc.logger.Println("║  CSV TO PARQUET - ONE WRITE PER FILE                 ║")
 	sc.logger.Println("╚═══════════════════════════════════════════════════════╝")
-	sc.logger.Printf("Input:         %s", sc.csvPath)
-	sc.logger.Printf("Output:        %s", sc.outputFolder)
-	sc.logger.Printf("Max file size: %d MB\n", MaxFileSizeMB)
+	sc.logger.Printf("Input:            %s", sc.csvPath)
+	sc.logger.Printf("Output:           %s", sc.outputFolder)
+	sc.logger.Printf("Target file size: %d MB", MaxFileSizeMB)
+	sc.logger.Printf("Records per file: ~%d\n", RecordsPerFile)
 
 	file, err := os.Open(sc.csvPath)
 	if err != nil {
@@ -333,6 +231,8 @@ func (sc *SimpleConverter) Convert() error {
 	sc.logger.Println("\n📦 Processing records...")
 	sc.startTime = time.Now()
 
+	// Buffer to accumulate records
+	recordBuffer := make([]ConsumerRecord, 0, RecordsPerFile)
 	lastUpdate := time.Now()
 
 	for {
@@ -351,11 +251,17 @@ func (sc *SimpleConverter) Convert() error {
 			continue
 		}
 
-		if err := sc.addRecord(record); err != nil {
-			return fmt.Errorf("error adding record: %w", err)
-		}
-
+		recordBuffer = append(recordBuffer, record)
 		sc.totalRecords++
+
+		// When buffer reaches target size, write to file
+		if len(recordBuffer) >= RecordsPerFile {
+			if err := sc.writeRecordsToFile(recordBuffer); err != nil {
+				return fmt.Errorf("failed to write file: %w", err)
+			}
+			// Clear buffer for next file
+			recordBuffer = recordBuffer[:0]
+		}
 
 		// Progress update every 5 seconds
 		if time.Since(lastUpdate) >= 5*time.Second {
@@ -366,16 +272,11 @@ func (sc *SimpleConverter) Convert() error {
 		}
 	}
 
-	// Flush any remaining records
-	if len(sc.recordBuffer) > 0 {
-		if err := sc.writeBufferedRecords(); err != nil {
-			return err
+	// Write remaining records
+	if len(recordBuffer) > 0 {
+		if err := sc.writeRecordsToFile(recordBuffer); err != nil {
+			return fmt.Errorf("failed to write final file: %w", err)
 		}
-	}
-
-	// Close final writer
-	if err := sc.closeCurrentWriter(); err != nil {
-		return err
 	}
 
 	elapsed := time.Since(sc.startTime)
