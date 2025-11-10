@@ -57,7 +57,7 @@ var (
 	step3Workers     int
 
 	//Consumer Matching Parameters
-	MatchRadiusMeters = 30.0
+	MatchRadiusMeters = 20.0
 	ParallelWorkers   int
 	GridSize          = 0.001
 )
