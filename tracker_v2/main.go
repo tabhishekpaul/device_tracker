@@ -1842,6 +1842,21 @@ func GetLastNDates(endDate string, n int) []string {
 	return dates
 }
 
+func GetLastNDatesFromDate(endDate string, n int) []string {
+	end, err := time.Parse("2006-01-02", endDate)
+	if err != nil {
+		return []string{}
+	}
+
+	dates := make([]string, 0, n)
+	for i := n - 1; i >= 0; i-- {
+		date := end.AddDate(0, 0, -i)
+		dates = append(dates, date.Format("20060102"))
+	}
+
+	return dates
+}
+
 func GetLastNDatesFromYesterday(n int) []string {
 	dates := make([]string, n)
 	for i := 0; i < n; i++ {
@@ -1924,9 +1939,14 @@ func RunDeviceTracker(runSteps []int, dates []string) error {
 		for _, date := range dates {
 
 			consumerFolder := filepath.Join(outputFolder, "consumers")
-			idleDevicesPath := filepath.Join(outputFolder, "Idle_devices.json")
+			idleDates := GetLastNDatesFromDate(date, 7)
+			idleDevicesPaths := []string{}
 
-			matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath, strings.ReplaceAll(date, "-", ""))
+			for _, idleDate := range idleDates {
+				idleDevicesPaths = append(idleDevicesPaths, filepath.Join(outputFolder, "idle_devices/idle_devices_%s.json", idleDate))
+			}
+
+			matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPaths, strings.ReplaceAll(date, "-", ""))
 
 			if err := matcher.Run(); err != nil {
 				log.Fatalf("Error: %v", err)

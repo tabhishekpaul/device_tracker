@@ -21,8 +21,6 @@ import (
 	"github.com/paulmach/orb/geo"
 )
 
-
-
 type ConsumerRecord struct {
 	ID              uint64
 	Latitude        float64
@@ -78,7 +76,7 @@ type MatchOutputJSON struct {
 type ConsumerDeviceMatcher struct {
 	outputFolder       string
 	consumerFolder     string
-	idleDevicesPath    string
+	idleDevicesPaths   []string
 	logger             *log.Logger
 	deviceSpatialIndex map[int64][]IdleDevice
 	indexMutex         sync.RWMutex
@@ -94,12 +92,12 @@ type ConsumerDeviceMatcher struct {
 	uniqueConsumerSet  map[uint64]bool
 }
 
-func NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPath string, processedDate string) *ConsumerDeviceMatcher {
+func NewConsumerDeviceMatcher(outputFolder, consumerFolder string, idleDevicesPaths []string, processedDate string) *ConsumerDeviceMatcher {
 	return &ConsumerDeviceMatcher{
 		outputFolder:       outputFolder,
 		processedDate:      processedDate,
 		consumerFolder:     consumerFolder,
-		idleDevicesPath:    idleDevicesPath,
+		idleDevicesPaths:   idleDevicesPaths,
 		logger:             log.New(os.Stdout, "[Step4] ", log.LstdFlags),
 		deviceSpatialIndex: make(map[int64][]IdleDevice),
 		matches:            make([]ConsumerDeviceMatch, 0),
@@ -132,55 +130,73 @@ func getNearbyCells(lat, lon, radiusMeters float64) []int64 {
 }
 
 func (cdm *ConsumerDeviceMatcher) loadIdleDevices() error {
-	cdm.logger.Println("Loading idle devices...")
-
-	file, err := os.Open(cdm.idleDevicesPath)
-	if err != nil {
-		return fmt.Errorf("failed to open idle devices file: %w", err)
-	}
-	defer file.Close()
-
-	// 🆕 MODIFIED: Load from new structure with event_date field
-	var idleData struct {
-		EventDate        string `json:"event_date"`
-		TotalIdleDevices int    `json:"total_idle_devices"`
-		IdleDevices      []struct {
-			DeviceID    string `json:"device_id"`
-			VisitedTime string `json:"visited_time"`
-			Address     string `json:"address"`
-			Campaign    string `json:"campaign"`
-			CampaignID  string `json:"campaign_id"`
-			POIID       string `json:"poi_id"`
-			Geometry    string `json:"geometry"`
-		} `json:"idle_devices"`
-	}
-
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&idleData); err != nil {
-		return fmt.Errorf("failed to decode idle devices: %w", err)
-	}
+	cdm.logger.Println("Loading idle devices from multiple files...")
 
 	totalDevices := 0
-	for _, device := range idleData.IdleDevices {
-		lat, lon := cdm.parsePoint(device.Geometry)
+	filesProcessed := 0
 
-		idleDevice := IdleDevice{
-			DeviceID:    device.DeviceID,
-			VisitedTime: device.VisitedTime,
-			Address:     device.Address,
-			Campaign:    device.Campaign,
-			CampaignID:  device.CampaignID,
-			POIID:       device.POIID,
-			Latitude:    lat,
-			Longitude:   lon,
+	for _, path := range cdm.idleDevicesPaths {
+		file, err := os.Open(path)
+		if err != nil {
+			cdm.logger.Printf("⚠️ Warning: failed to open idle devices file %s: %v", path, err)
+			continue // Skip this file and continue with others
 		}
 
-		cellKey := getCellKey(lat, lon)
-		cdm.deviceSpatialIndex[cellKey] = append(cdm.deviceSpatialIndex[cellKey], idleDevice)
-		totalDevices++
+		// Load from structure with event_date field
+		var idleData struct {
+			EventDate        string `json:"event_date"`
+			TotalIdleDevices int    `json:"total_idle_devices"`
+			IdleDevices      []struct {
+				DeviceID    string `json:"device_id"`
+				VisitedTime string `json:"visited_time"`
+				Address     string `json:"address"`
+				Campaign    string `json:"campaign"`
+				CampaignID  string `json:"campaign_id"`
+				POIID       string `json:"poi_id"`
+				Geometry    string `json:"geometry"`
+			} `json:"idle_devices"`
+		}
+
+		decoder := json.NewDecoder(file)
+		if err := decoder.Decode(&idleData); err != nil {
+			file.Close()
+			cdm.logger.Printf("⚠️ Warning: failed to decode idle devices from %s: %v", path, err)
+			continue // Skip this file and continue with others
+		}
+
+		fileDeviceCount := 0
+		for _, device := range idleData.IdleDevices {
+			lat, lon := cdm.parsePoint(device.Geometry)
+
+			idleDevice := IdleDevice{
+				DeviceID:    device.DeviceID,
+				VisitedTime: device.VisitedTime,
+				Address:     device.Address,
+				Campaign:    device.Campaign,
+				CampaignID:  device.CampaignID,
+				POIID:       device.POIID,
+				Latitude:    lat,
+				Longitude:   lon,
+			}
+
+			cellKey := getCellKey(lat, lon)
+			cdm.deviceSpatialIndex[cellKey] = append(cdm.deviceSpatialIndex[cellKey], idleDevice)
+			fileDeviceCount++
+		}
+
+		file.Close()
+		totalDevices += fileDeviceCount
+		filesProcessed++
+		cdm.logger.Printf("  → Loaded %d devices from %s (event_date: %s)",
+			fileDeviceCount, path, idleData.EventDate)
 	}
 
-	cdm.logger.Printf("✅ Loaded %d idle devices in %d grid cells", totalDevices, len(cdm.deviceSpatialIndex))
+	if filesProcessed == 0 {
+		return fmt.Errorf("failed to load any idle device files")
+	}
+
+	cdm.logger.Printf("✅ Loaded %d idle devices from %d files across %d grid cells",
+		totalDevices, filesProcessed, len(cdm.deviceSpatialIndex))
 	return nil
 }
 
