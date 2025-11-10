@@ -1943,7 +1943,7 @@ func RunDeviceTracker(runSteps []int, dates []string) error {
 			idleDevicesPaths := []string{}
 
 			for _, idleDate := range idleDates {
-				idleDevicesPaths = append(idleDevicesPaths, filepath.Join(outputFolder, "idle_devices/idle_devices_%s.json", idleDate))
+				idleDevicesPaths = append(idleDevicesPaths, filepath.Join(outputFolder, fmt.Sprintf("idle_devices/idle_devices_%s.json", idleDate)))
 			}
 
 			matcher := NewConsumerDeviceMatcher(outputFolder, consumerFolder, idleDevicesPaths, strings.ReplaceAll(date, "-", ""))
